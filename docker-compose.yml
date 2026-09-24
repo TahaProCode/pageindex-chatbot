@@ -1,0 +1,54 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: pageindex-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pageindex_db
+    ports:
+      # Host-side access only (e.g. Adminer, a local psql client). The
+      # backend container talks to Postgres over the internal Docker
+      # network using the hostname "postgres", so this mapping doesn't
+      # need to match any port your backend uses.
+      - "5434:5432"
+    volumes:
+      - pageindex_pg_data:/var/lib/postgresql/data
+
+  adminer:
+    image: adminer
+    container_name: pageindex-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    depends_on:
+      - postgres
+
+  backend:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: pageindex-backend
+    restart: unless-stopped
+    environment:
+      # Internal Docker network hostname "postgres", not localhost.
+      DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/pageindex_db
+      # host.docker.internal lets the container reach Ollama running on
+      # your Windows host machine (works out of the box on Docker Desktop).
+      OLLAMA_BASE_URL: http://host.docker.internal:11434
+      OLLAMA_MODEL: qwen2.5:7b
+      OLLAMA_TIMEOUT_SECONDS: "360"
+      UPLOAD_DIR: /app/uploads
+      MAX_UPLOAD_SIZE_MB: "50"
+      FRONTEND_ORIGIN: http://localhost:8000
+    ports:
+      - "7000:8000"
+    volumes:
+      - pageindex_uploads:/app/uploads
+    depends_on:
+      - postgres
+
+volumes:
+  pageindex_pg_data:
+  pageindex_uploads:
