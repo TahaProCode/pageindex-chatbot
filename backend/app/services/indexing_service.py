@@ -2,7 +2,7 @@
 """
 Runs as a FastAPI background task right after upload. Creates its own DB
 session since the request-scoped session from the upload endpoint is
-already closed by the time this runs.
+already closed by the time this runs
 """
 import traceback
 from app.db.database import SessionLocal
@@ -32,9 +32,9 @@ def process_document(document_id: str) -> None:
         doc.status = DocumentStatus.indexing
         db.commit()
 
-        # Phase 3: generate a short LLM summary for every node, bottom-up.
+        # Phase 3: generate a short LLM summary for every node, bottom-up
         # This is the slow step (one Ollama call per node) - expect
-        # indexing to take a while on larger documents with a 4B model.
+        # indexing to take a while on larger documents with a 4B model
         generate_summaries_for_document(db, document_id)
 
         doc.status = DocumentStatus.ready

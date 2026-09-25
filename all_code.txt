@@ -529,7 +529,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b"
     ollama_embedding_model: str = "nomic-embed-text"
-    ollama_timeout_seconds: int = 120
+    ollama_timeout_seconds: int = 180
 
     # --- File storage ---
     upload_dir: str = "uploads"
@@ -538,12 +538,26 @@ class Settings(BaseSettings):
     # --- CORS ---
     frontend_origin: str = "http://localhost:5173"
 
+    # --- Indexing concurrency ---
+    # How many documents can be indexed in parallel. Parsing is CPU-bound;
+    # LLM summary calls are I/O-bound. 3-4 is a safe default for a single
+    # local Ollama instance without saturating it.
+    max_concurrent_indexing: int = 3
+
+    # --- Summary concurrency ---
+    # Max parallel LLM summary calls within a single document (semaphore).
+    max_concurrent_summaries: int = 4
+
+    # --- Retrieval ---
+    max_candidate_documents: int = 15
+    max_total_context_nodes: int = 10
+    max_hops: int = 3
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
 # Single shared settings instance, import this everywhere.
-settings = Settings()
- 
+settings = Settings() 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\core\__init__.py === 
  
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\db\database.py === 
@@ -1176,53 +1190,31 @@ class HealthOut(BaseModel):
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\schemas\__init__.py === 
  
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\corpus_service.py === 
-### backend/app/services/corpus_service.py
 """
-Phase 6 (Chunk 3), Step 2 (upgraded for 200-document scale, then again for
-batch scoping): corpus-wide candidate narrowing.
+Corpus-wide candidate narrowing, scoped to a single upload batch.
 
-When a user asks a question in "search across the batch" mode, we can't
-afford to run the full tree-search (collect_relevant_nodes) on every
-document in the batch - that's one or more Ollama calls PER DOCUMENT PER
-TREE LEVEL, which doesn't scale past a handful of files.
-
-Instead, this module does a cheap pass first: show the LLM every
-candidate document's rollup summary + keywords (generated in Chunk 2 by
-summary_service.py) and ask which documents are even worth searching for
-this question. Only those "candidate" documents go on to the real
-per-document tree-search in the next step (multi-doc orchestrator).
-
-IMPORTANT: narrowing is now scoped to a single batch_id. A batch is the
-set of documents a user uploaded together and is chatting with as one
-unit - documents from OTHER batches must never leak into this search,
-even if they're both "ready". Without this filter, a 10-document batch
-would get its candidates diluted (or replaced) by unrelated documents
-from a different 200-document batch sitting in the same table.
-
-Only documents with status == ready are considered, since summary/
-keywords/tree nodes don't exist yet for documents still indexing.
+When a user asks a question we cannot afford full tree-search on every
+document. This module does a cheap pass first using document-level
+summary + keywords, then (if the LLM finds nothing) falls back to a
+simple BM25-style keyword ranking so we never silently return "most
+recent documents" that have nothing to do with the query.
 """
 import asyncio
 import json
 import logging
+import math
 import re
+from collections import Counter
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import Document, DocumentStatus
 from app.services.ollama_service import chat_completion
 
 logger = logging.getLogger("pageindex.corpus")
 
-# How many candidate documents to hand off to the per-document tree-search
-# (Step 4 in the pipeline). 10-20 chosen so that even if a couple of true
-# positives get missed by the LLM narrowing pass, there's enough headroom
-# for the answer to still be found among the survivors.
 MAX_CANDIDATE_DOCUMENTS = 15
-
-# How many documents go into ONE narrowing prompt. Keeps each individual
-# LLM call's listing short enough for a 4B model to reason over reliably.
-# e.g. 200 documents / 40 per batch = 5 LLM calls, run in parallel.
 DOCUMENTS_PER_BATCH = 40
 
 CANDIDATE_SELECTION_SYSTEM_PROMPT = (
@@ -1252,26 +1244,91 @@ def _format_document_listing(documents: list[Document]) -> str:
         keywords = _parse_keywords(doc.keywords)
         keywords_str = ", ".join(keywords) if keywords else "(none)"
         summary = doc.summary or "(no summary available)"
-        lines.append(f"{i + 1}. {doc.filename}\n   Summary: {summary}\n   Keywords: {keywords_str}")
+        lines.append(
+            f"{i + 1}. {doc.filename}\n   Summary: {summary}\n   Keywords: {keywords_str}"
+        )
     return "\n".join(lines)
 
 
 def _chunk_list(items: list, size: int) -> list[list]:
-    return [items[i:i + size] for i in range(0, len(items), size)]
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-async def _narrow_one_batch(question: str, batch: list[Document], batch_label: str) -> list[Document]:
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]{2,}", (text or "").lower())
+
+
+def _bm25_rank(
+    question: str,
+    documents: list[Document],
+    top_n: int,
+) -> list[Document]:
     """
-    Runs the narrowing prompt on a single LLM-call-sized batch of documents
-    (<= DOCUMENTS_PER_BATCH) and returns the Document rows from THIS batch
-    that the LLM picked.
-
-    Note: this is an internal chunking batch for the LLM prompt, distinct
-    from the user-facing upload Batch (models.Batch) - a single upload
-    Batch of e.g. 200 documents gets split into several of these here.
+    Lightweight BM25-inspired ranking over document filename + summary + keywords.
+    Used as fallback when the LLM narrowing returns nothing relevant.
     """
+    query_tokens = _tokenize(question)
+    if not query_tokens or not documents:
+        return documents[:top_n]
+
+    # Document "text" for scoring
+    doc_texts = []
+    for doc in documents:
+        parts = [doc.filename or ""]
+        if doc.summary:
+            parts.append(doc.summary)
+        kws = _parse_keywords(doc.keywords)
+        parts.extend(kws)
+        doc_texts.append(" ".join(parts))
+
+    tokenized_docs = [_tokenize(t) for t in doc_texts]
+    doc_lens = [len(td) or 1 for td in tokenized_docs]
+    avgdl = sum(doc_lens) / len(doc_lens)
+
+    # Document frequency
+    df: Counter = Counter()
+    for td in tokenized_docs:
+        df.update(set(td))
+
+    N = len(documents)
+    k1 = 1.5
+    b = 0.75
+
+    scores = []
+    for i, td in enumerate(tokenized_docs):
+        tf = Counter(td)
+        score = 0.0
+        for qt in query_tokens:
+            if qt not in tf:
+                continue
+            idf = math.log(1 + (N - df[qt] + 0.5) / (df[qt] + 0.5))
+            freq = tf[qt]
+            denom = freq + k1 * (1 - b + b * doc_lens[i] / avgdl)
+            score += idf * (freq * (k1 + 1)) / denom
+        scores.append((score, documents[i]))
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+    ranked = [doc for sc, doc in scores if sc > 0][:top_n]
+
+    logger.info(
+        "BM25 fallback ranked %d docs (top scores): %s",
+        len(ranked),
+        [(round(sc, 3), d.filename) for sc, d in scores[:5]],
+    )
+    # If BM25 found nothing, fall back to most recent as last resort
+    if not ranked:
+        return documents[:top_n]
+    return ranked
+
+
+async def _narrow_one_batch(
+    question: str, batch: list[Document], batch_label: str
+) -> list[Document]:
     listing = _format_document_listing(batch)
-    prompt = f"Question: {question}\n\nDocuments:\n{listing}\n\nWhich document numbers might contain the answer?"
+    prompt = (
+        f"Question: {question}\n\nDocuments:\n{listing}\n\n"
+        "Which document numbers might contain the answer?"
+    )
 
     logger.info(
         "[%s] Asking LLM to narrow among %d documents: %s",
@@ -1280,14 +1337,13 @@ async def _narrow_one_batch(question: str, batch: list[Document], batch_label: s
 
     response = await chat_completion(prompt=prompt, system=CANDIDATE_SELECTION_SYSTEM_PROMPT)
 
-    numbers = sorted(set(int(x) for x in re.findall(r"\d+", response)))
+    numbers = sorted(set(int(x) for x in re.findall(r"\b\d+\b", response)))
     selected = [batch[n - 1] for n in numbers if 1 <= n <= len(batch)]
 
     logger.info(
         "[%s] LLM raw reply=%r -> parsed_numbers=%s -> picked=%s",
         batch_label, response, numbers, [d.filename for d in selected],
     )
-
     return selected
 
 
@@ -1295,23 +1351,15 @@ async def narrow_candidate_documents(
     db: Session,
     question: str,
     batch_id: str,
-    max_candidates: int = MAX_CANDIDATE_DOCUMENTS,
+    max_candidates: int | None = None,
     documents_per_batch: int = DOCUMENTS_PER_BATCH,
 ) -> list[Document]:
     """
     Returns a shortlist of Document rows worth running the full tree-search
-    on for this question, using only their rollup summary+keywords.
-
-    Scoped to a single upload-batch (batch_id) - documents from any other
-    batch are never considered, no matter how many total documents exist
-    in the system.
-
-    For batches larger than `documents_per_batch`, documents are split
-    into LLM-call-sized chunks and narrowed in parallel (one LLM call per
-    chunk, not one call for the whole batch) - this keeps each prompt
-    short and lets narrowing scale to hundreds of documents without the
-    accuracy hit of one giant list.
+    on for this question, scoped to a single upload-batch.
     """
+    max_candidates = max_candidates or settings.max_candidate_documents
+
     documents = (
         db.query(Document)
         .filter(Document.batch_id == batch_id, Document.status == DocumentStatus.ready)
@@ -1338,13 +1386,14 @@ async def narrow_candidate_documents(
     )
 
     chunk_results = await asyncio.gather(*[
-        _narrow_one_batch(question, chunk, batch_label=f"batch={batch_id} chunk={i + 1}/{len(chunks)}")
+        _narrow_one_batch(
+            question, chunk,
+            batch_label=f"batch={batch_id} chunk={i + 1}/{len(chunks)}",
+        )
         for i, chunk in enumerate(chunks)
     ])
 
-    # Merge picks from all chunks, preserving order and de-duplicating
-    # (a document can only appear in one chunk anyway, but stay safe).
-    seen_ids = set()
+    seen_ids: set[str] = set()
     merged: list[Document] = []
     for chunk_selected in chunk_results:
         for doc in chunk_selected:
@@ -1358,80 +1407,113 @@ async def narrow_candidate_documents(
     )
 
     if not merged:
+        # BM25 / keyword ranking fallback instead of blind "most recent"
         logger.info(
-            "LLM found no relevant documents in any chunk - falling back to "
-            "most recent %d in this batch as a safety net", max_candidates,
+            "LLM found no relevant documents - applying BM25 keyword ranking fallback"
         )
-        return documents[:max_candidates]
+        return _bm25_rank(question, documents, max_candidates)
 
     if len(merged) > max_candidates:
         logger.info(
-            "Merged candidates (%d) exceed max_candidates (%d) - truncating "
-            "to the %d most recently created among them",
-            len(merged), max_candidates, max_candidates,
+            "Merged candidates (%d) exceed max_candidates (%d) - truncating",
+            len(merged), max_candidates,
         )
         merged = merged[:max_candidates]
 
     return merged 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\indexing_queue.py === 
-### Indexing_queue.py
-
 """
-Ensures documents are indexed strictly one at a time, no matter how many
-uploads arrive close together (e.g. a 200-file batch upload). A single
-dedicated worker thread pulls document ids off a FIFO queue and processes
-them sequentially - this keeps Ollama from being hit with dozens of
-concurrent indexing requests at once.
+Multi-worker indexing queue.
+
+Documents are processed with controlled concurrency (default 3 workers)
+so a 200-file batch finishes in a fraction of the time of a single-threaded
+queue, while still protecting the local Ollama instance from being
+saturated by dozens of concurrent indexing jobs.
 """
 import logging
 import queue
 import threading
 
+from app.core.config import settings
 from app.services.indexing_service import process_document
 
 logger = logging.getLogger("pageindex.queue")
 
 _queue: "queue.Queue[str]" = queue.Queue()
-_worker_started = False
+_workers_started = False
 _lock = threading.Lock()
 
+# Safe default if config.py was not updated yet
+DEFAULT_MAX_CONCURRENT_INDEXING = 3
 
-def _worker_loop() -> None:
+
+def _worker_loop(worker_id: int) -> None:
     while True:
         document_id = _queue.get()
         try:
             logger.info(
-                "Indexing queue: starting document %s (%d remaining after this)",
-                document_id, _queue.qsize(),
+                "Indexing worker-%d: starting document %s (%d remaining in queue)",
+                worker_id, document_id, _queue.qsize(),
             )
             process_document(document_id)
+            logger.info(
+                "Indexing worker-%d: finished document %s",
+                worker_id, document_id,
+            )
         except Exception:
-            logger.exception("Indexing queue: unhandled error processing document %s", document_id)
+            logger.exception(
+                "Indexing worker-%d: unhandled error processing document %s",
+                worker_id, document_id,
+            )
         finally:
             _queue.task_done()
 
 
 def start_worker() -> None:
-    """Call once at app startup. Safe to call multiple times."""
-    global _worker_started
+    """
+    Call once at app startup. Spawns concurrent worker threads.
+    Safe to call multiple times (idempotent).
+    """
+    global _workers_started
     with _lock:
-        if not _worker_started:
-            t = threading.Thread(target=_worker_loop, daemon=True, name="indexing-worker")
+        if _workers_started:
+            return
+
+        n_workers = max(
+            1,
+            getattr(settings, "max_concurrent_indexing", DEFAULT_MAX_CONCURRENT_INDEXING),
+        )
+        for i in range(n_workers):
+            t = threading.Thread(
+                target=_worker_loop,
+                args=(i + 1,),
+                daemon=True,
+                name=f"indexing-worker-{i + 1}",
+            )
             t.start()
-            _worker_started = True
-            logger.info("Indexing worker thread started")
+
+        _workers_started = True
+        logger.info(
+            "Indexing workers started: %d concurrent workers",
+            n_workers,
+        )
 
 
 def enqueue_document(document_id: str) -> int:
     """Adds a document to the indexing queue. Returns the new queue size."""
     _queue.put(document_id)
+    return _queue.qsize()
+
+
+def queue_size() -> int:
+    """Current number of documents waiting (not including those in-flight)."""
     return _queue.qsize() 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\indexing_service.py === 
 ### indexing_service.py
 """
 Runs as a FastAPI background task right after upload. Creates its own DB
 session since the request-scoped session from the upload endpoint is
-already closed by the time this runs.
+already closed by the time this runs
 """
 import traceback
 from app.db.database import SessionLocal
@@ -1461,9 +1543,9 @@ def process_document(document_id: str) -> None:
         doc.status = DocumentStatus.indexing
         db.commit()
 
-        # Phase 3: generate a short LLM summary for every node, bottom-up.
+        # Phase 3: generate a short LLM summary for every node, bottom-up
         # This is the slow step (one Ollama call per node) - expect
-        # indexing to take a while on larger documents with a 4B model.
+        # indexing to take a while on larger documents with a 4B model
         generate_summaries_for_document(db, document_id)
 
         doc.status = DocumentStatus.ready
@@ -1479,35 +1561,18 @@ def process_document(document_id: str) -> None:
     finally:
         db.close() 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\multi_doc_service.py === 
-# multi_doc_service.py
+"""
+Multi-document orchestrator (batch-scoped) with multi-hop loop.
 
-"""Phase 6 (Chunk 3 + Chunk 4, then batch-scoping): multi-document orchestrator.
+Pipeline:
+  1. narrow_candidate_documents() - shortlist within the batch
+  2. parallel tree-search on candidates
+  3. embedding rerank
+  4. completeness check; if incomplete, re-search for the gap (max hops)
 
-Chunk 3 built the base pipeline:
-  - corpus_service.narrow_candidate_documents(): cheap pass that shortlists
-    candidate documents out of a batch using rollup summary+keywords.
-  - retrieval_agent.collect_relevant_nodes(): existing single-document
-    tree-search, reused unchanged, run per candidate document in parallel.
-  - reranker_service.rerank_nodes(): (Chunk 4, Step 4a) embedding-based
-    cutoff replacing the old naive truncation.
-
-Chunk 4, Step 4b adds a MULTI-HOP LOOP on top of that base pipeline:
-some questions need evidence from more than one "round" of searching (e.g.
-"compare Company X's and Company Y's Q3 revenue" - a single narrow+search
-pass might surface only one company's numbers). After gathering context,
-a cheap completeness-check LLM call decides if the context is enough to
-answer the question. If not, it also tells us what's missing, we gather
-context for THAT, merge it with what we already have, and try again -
-up to MAX_HOPS times total, so the loop always terminates.
-
-This orchestrator is now BATCH-SCOPED: every call requires a batch_id, and
-every narrowing pass only considers documents belonging to that batch, so
-a 10-document batch and a 200-document batch never bleed into each other
-even though they live in the same documents table.
-
-The single-hop gathering logic (narrow -> parallel tree-search -> rerank)
-is pulled into _gather_context() so the multi-hop loop can call it
-repeatedly without duplicating that logic.
+Improvements:
+- Stricter completeness prompt so local models stop early when key facts exist.
+- Uses config-driven limits.
 """
 import asyncio
 import logging
@@ -1515,6 +1580,7 @@ import re
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import Document, TreeNode
 from app.services.corpus_service import narrow_candidate_documents
 from app.services.retrieval_agent import collect_relevant_nodes
@@ -1523,15 +1589,7 @@ from app.services.ollama_service import chat_completion
 
 logger = logging.getLogger("pageindex.multidoc")
 
-# How many nodes survive reranking to go into the final answer prompt.
-MAX_TOTAL_CONTEXT_NODES = 8
 CONTEXT_CHARS_PER_NODE = 3000
-
-# Multi-hop loop bounds (Chunk 4, Step 4b). MAX_HOPS=3 means: 1 initial
-# gather + up to 2 additional "fill the gap" gathers, matching the
-# project plan's "max 2-3 hops". This is a hard cap so the loop always
-# terminates even if the completeness-check keeps saying "incomplete".
-MAX_HOPS = 3
 
 MULTI_DOC_ANSWER_SYSTEM_PROMPT = (
     "Answer the user's question using ONLY the document excerpts provided "
@@ -1550,34 +1608,32 @@ NO_CONTEXT_SYSTEM_PROMPT = (
 
 COMPLETENESS_CHECK_SYSTEM_PROMPT = (
     "You are checking whether a set of document excerpts contains enough "
-    "information to fully answer a question. Reply in EXACTLY ONE of these "
-    "two formats, nothing else:\n"
+    "information to fully answer a question.\n"
+    "Rules:\n"
+    "- If the key entities, dates, numbers, or facts the question asks for "
+    "are present in the excerpts, reply COMPLETE.\n"
+    "- Only reply INCOMPLETE if a primary fact the question explicitly "
+    "requests is genuinely missing.\n"
+    "- Do NOT say INCOMPLETE just because more detail would be nice.\n"
+    "Reply in EXACTLY ONE of these two formats, nothing else:\n"
     "COMPLETE\n"
     "or\n"
     "INCOMPLETE: <a short, specific description of the missing information, "
-    "phrased as something to search for>\n"
-    "Only say INCOMPLETE if something the question explicitly asks for is "
-    "genuinely missing from the excerpts - not just because more detail "
-    "would be nice. If the excerpts already cover the question reasonably "
-    "well, say COMPLETE."
+    "phrased as something to search for>"
 )
 
 
 def _fetch_nodes_by_document(db: Session, document_ids: list[str]) -> dict[str, list[TreeNode]]:
-    """One bulk query for all candidate documents' tree nodes, grouped by document_id."""
     if not document_ids:
         return {}
-
     all_nodes = (
         db.query(TreeNode)
         .filter(TreeNode.document_id.in_(document_ids))
         .all()
     )
-
     by_document: dict[str, list[TreeNode]] = {doc_id: [] for doc_id in document_ids}
     for node in all_nodes:
         by_document.setdefault(node.document_id, []).append(node)
-
     return by_document
 
 
@@ -1587,11 +1643,9 @@ async def _collect_for_document(
     search_query: str,
     nodes: list[TreeNode],
 ) -> tuple[Document, list[TreeNode]]:
-    """Runs the existing single-document tree-search for one candidate document."""
     if not nodes:
         logger.info("Document %s (%s) has no tree nodes - skipping", document.id, document.filename)
         return document, []
-
     collected = await collect_relevant_nodes(db, document.id, search_query, nodes=nodes)
     return document, collected
 
@@ -1602,24 +1656,22 @@ async def _gather_context(
     batch_id: str,
     hop_label: str,
 ) -> list[tuple[Document, TreeNode]]:
-    """
-    One full "round" of gathering: narrow candidate documents WITHIN
-    batch_id for search_query, run tree-search on each candidate in
-    parallel, and return the raw (document, node) pairs collected (NOT
-    yet reranked - the caller merges across hops before doing a final
-    rerank).
-    """
     candidates = await narrow_candidate_documents(db, search_query, batch_id=batch_id)
     if not candidates:
-        logger.info("[%s] No candidate documents found in batch %s for query %r", hop_label, batch_id, search_query)
+        logger.info(
+            "[%s] No candidate documents found in batch %s for query %r",
+            hop_label, batch_id, search_query,
+        )
         return []
 
     candidate_ids = [doc.id for doc in candidates]
     nodes_by_document = _fetch_nodes_by_document(db, candidate_ids)
 
     logger.info(
-        "[%s] Running tree-search in parallel across %d candidate documents (batch=%s) for query %r: %s",
-        hop_label, len(candidates), batch_id, search_query, [d.filename for d in candidates],
+        "[%s] Running tree-search in parallel across %d candidate documents "
+        "(batch=%s) for query %r: %s",
+        hop_label, len(candidates), batch_id, search_query,
+        [d.filename for d in candidates],
     )
 
     results = await asyncio.gather(*[
@@ -1640,7 +1692,6 @@ def _merge_unique(
     existing: list[tuple[Document, TreeNode]],
     new: list[tuple[Document, TreeNode]],
 ) -> list[tuple[Document, TreeNode]]:
-    """Merges two (document, node) lists, de-duplicating by node id."""
     seen_node_ids = {node.id for _, node in existing}
     merged = list(existing)
     for document, node in new:
@@ -1651,11 +1702,10 @@ def _merge_unique(
 
 
 async def _check_completeness(question: str, context_text: str) -> tuple[bool, str | None]:
-    """
-    Asks the LLM whether the gathered context is enough to answer the
-    question. Returns (is_complete, missing_info_query_or_None).
-    """
-    prompt = f"Question: {question}\n\nGathered excerpts:\n{context_text}\n\nIs this enough to fully answer the question?"
+    prompt = (
+        f"Question: {question}\n\nGathered excerpts:\n{context_text}\n\n"
+        "Is this enough to fully answer the question?"
+    )
     response = await chat_completion(prompt=prompt, system=COMPLETENESS_CHECK_SYSTEM_PROMPT)
 
     stripped = response.strip()
@@ -1669,13 +1719,16 @@ async def _check_completeness(question: str, context_text: str) -> tuple[bool, s
     return True, None
 
 
-def _build_context_text(nodes_with_documents: list[tuple[Document, TreeNode]]) -> tuple[str, list[dict]]:
+def _build_context_text(
+    nodes_with_documents: list[tuple[Document, TreeNode]],
+) -> tuple[str, list[dict]]:
     context_blocks = []
     sources = []
     for document, node in nodes_with_documents:
         text = (node.raw_text or "").strip() or "(no direct text - see subsections)"
         context_blocks.append(
-            f"### [{document.filename}] {node.title} (pages {node.page_start}-{node.page_end})\n"
+            f"### [{document.filename}] {node.title} "
+            f"(pages {node.page_start}-{node.page_end})\n"
             f"{text[:CONTEXT_CHARS_PER_NODE]}"
         )
         sources.append({
@@ -1691,43 +1744,36 @@ def _build_context_text(nodes_with_documents: list[tuple[Document, TreeNode]]) -
 
 async def answer_question_multi_doc(db: Session, question: str, batch_id: str) -> dict:
     """
-    Answers a question by searching across every ready document in
-    batch_id, with a multi-hop loop (Chunk 4, Step 4b) that re-searches
-    for missing information when the first pass's context looks
-    incomplete.
-
-    Returns:
-        {
-            "answer": str,
-            "sources": [{"document_id", "filename", "node_id", "title",
-                          "page_start", "page_end"}, ...],
-            "hops_used": int,
-        }
+    Answers a question by searching across every ready document in batch_id,
+    with a multi-hop loop that re-searches for missing information.
     """
+    max_hops = settings.max_hops
+    max_context = settings.max_total_context_nodes
+
     logger.info("=== New multi-document question for batch %s: %r ===", batch_id, question)
 
     accumulated: list[tuple[Document, TreeNode]] = []
     search_query = question
+    hop = 0
 
-    for hop in range(1, MAX_HOPS + 1):
-        hop_label = f"batch={batch_id} hop={hop}/{MAX_HOPS}"
+    for hop in range(1, max_hops + 1):
+        hop_label = f"batch={batch_id} hop={hop}/{max_hops}"
 
-        new_nodes = await _gather_context(db, search_query, batch_id=batch_id, hop_label=hop_label)
+        new_nodes = await _gather_context(
+            db, search_query, batch_id=batch_id, hop_label=hop_label
+        )
         accumulated = _merge_unique(accumulated, new_nodes)
 
         if not accumulated:
             logger.info("[%s] No relevant nodes found in any candidate document yet", hop_label)
-            if hop == MAX_HOPS:
+            if hop == max_hops:
                 break
             continue
 
-        # Rerank the full accumulated set against the ORIGINAL question
-        # (not the sub-query) so relevance is always judged against what
-        # the user actually asked, even on later hops.
-        reranked = await rerank_nodes(question, accumulated, top_n=MAX_TOTAL_CONTEXT_NODES)
+        reranked = await rerank_nodes(question, accumulated, top_n=max_context)
         context_text, sources = _build_context_text(reranked)
 
-        if hop == MAX_HOPS:
+        if hop == max_hops:
             logger.info("[%s] Reached MAX_HOPS - using accumulated context as-is", hop_label)
             break
 
@@ -1747,23 +1793,29 @@ async def answer_question_multi_doc(db: Session, question: str, batch_id: str) -
         )
         return {"answer": answer, "sources": [], "hops_used": hop}
 
-    reranked = await rerank_nodes(question, accumulated, top_n=MAX_TOTAL_CONTEXT_NODES)
+    reranked = await rerank_nodes(question, accumulated, top_n=max_context)
     context_text, sources = _build_context_text(reranked)
 
-    logger.info("Generating final multi-document answer from %d context nodes (batch=%s, hops_used=%d)", len(reranked), batch_id, hop)
+    logger.info(
+        "Generating final multi-document answer from %d context nodes "
+        "(batch=%s, hops_used=%d)",
+        len(reranked), batch_id, hop,
+    )
     final_prompt = f"Document excerpts:\n\n{context_text}\n\nQuestion: {question}"
     answer = await chat_completion(prompt=final_prompt, system=MULTI_DOC_ANSWER_SYSTEM_PROMPT)
 
     return {"answer": answer, "sources": sources, "hops_used": hop} 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\ollama_service.py === 
-### ollama_service.py
 """
 Thin wrapper around the local Ollama server.
-Kept dependency-free (plain httpx) so we're not locked into a framework
-while the core tree-search logic is still being validated (see project plan).
+Kept dependency-free (plain httpx) so we're not locked into a framework.
+Supports single and batch embedding calls for high-throughput reranking.
+
+Handles both modern (/api/embed) and legacy (/api/embeddings) Ollama endpoints.
 """
 import logging
 import time
+from typing import List
 
 import httpx
 
@@ -1774,42 +1826,101 @@ logger = logging.getLogger("pageindex.ollama")
 
 async def get_embedding(text: str) -> list[float]:
     """
-    Gets a vector embedding for a piece of text from Ollama's embedding
-    endpoint (separate from /api/chat - this uses a dedicated embedding
-    model, e.g. nomic-embed-text, not the chat model qwen3:4b).
-
-    Used by reranker_service.py for cheap, LLM-free relevance scoring -
-    no /api/chat call involved here, so this is fast even for many nodes.
+    Gets a vector embedding for a single piece of text.
+    Prefer get_embeddings_batch() when you have multiple texts.
     """
-    payload = {
-        "model": settings.ollama_embedding_model,
-        "input": text,
-    }
+    vectors = await get_embeddings_batch([text])
+    return vectors[0]
+
+
+async def get_embeddings_batch(texts: List[str]) -> List[list[float]]:
+    """
+    Batch embedding: prefers /api/embed (modern, supports real batching).
+    Falls back to sequential /api/embeddings calls if the server returns 404
+    (older Ollama versions).
+    """
+    if not texts:
+        return []
+
+    # Ollama can handle reasonably large batches; chunk if extremely large
+    MAX_BATCH = 64
+    if len(texts) > MAX_BATCH:
+        results: List[list[float]] = []
+        for i in range(0, len(texts), MAX_BATCH):
+            chunk = texts[i : i + MAX_BATCH]
+            results.extend(await get_embeddings_batch(chunk))
+        return results
 
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-            resp = await client.post(f"{settings.ollama_base_url}/api/embed", json=payload)
+            # --- Prefer modern endpoint ---
+            payload = {
+                "model": settings.ollama_embedding_model,
+                "input": texts,
+            }
+            resp = await client.post(
+                f"{settings.ollama_base_url}/api/embed", json=payload
+            )
+
+            if resp.status_code == 404:
+                # Older Ollama – fall back to legacy single-item endpoint
+                logger.warning(
+                    "Ollama /api/embed returned 404 – falling back to legacy "
+                    "/api/embeddings (consider upgrading Ollama)"
+                )
+                return await _legacy_embeddings_batch(client, texts)
+
             resp.raise_for_status()
             data = resp.json()
     except Exception:
         elapsed = time.monotonic() - start
-        logger.exception("Ollama EMBED REQUEST FAILED after %.1fs", elapsed)
+        logger.exception(
+            "Ollama BATCH EMBED REQUEST FAILED after %.1fs (n=%d)",
+            elapsed, len(texts),
+        )
         raise
 
     elapsed = time.monotonic() - start
-    # Ollama's /api/embed returns {"embeddings": [[...]]} - a list of vectors,
-    # one per input. We send one input at a time, so take the first.
     embeddings = data.get("embeddings", [])
-    if not embeddings:
-        raise ValueError(f"Ollama returned no embeddings for input of {len(text)} chars")
+    if len(embeddings) != len(texts):
+        raise ValueError(
+            f"Ollama returned {len(embeddings)} embeddings for {len(texts)} inputs"
+        )
 
-    vector = embeddings[0]
     logger.info(
-        "Ollama EMBED: elapsed=%.1fs text_chars=%d vector_dim=%d",
-        elapsed, len(text), len(vector),
+        "Ollama BATCH EMBED: elapsed=%.1fs n=%d total_chars=%d dim=%d",
+        elapsed,
+        len(texts),
+        sum(len(t) for t in texts),
+        len(embeddings[0]) if embeddings else 0,
     )
-    return vector
+    return embeddings
+
+
+async def _legacy_embeddings_batch(
+    client: httpx.AsyncClient, texts: List[str]
+) -> List[list[float]]:
+    """
+    Sequential fallback using the old /api/embeddings endpoint
+    (expects "prompt" and returns "embedding").
+    """
+    results: List[list[float]] = []
+    for text in texts:
+        payload = {
+            "model": settings.ollama_embedding_model,
+            "prompt": text,
+        }
+        resp = await client.post(
+            f"{settings.ollama_base_url}/api/embeddings", json=payload
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        emb = data.get("embedding")
+        if emb is None:
+            raise ValueError("Legacy /api/embeddings response missing 'embedding'")
+        results.append(emb)
+    return results
 
 
 def _strip_thinking(content: str) -> str:
@@ -1864,7 +1975,9 @@ async def chat_completion(prompt: str, system: str | None = None) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-            resp = await client.post(f"{settings.ollama_base_url}/api/chat", json=payload)
+            resp = await client.post(
+                f"{settings.ollama_base_url}/api/chat", json=payload
+            )
             resp.raise_for_status()
             data = resp.json()
     except Exception:
@@ -1890,12 +2003,10 @@ async def chat_completion(prompt: str, system: str | None = None) -> str:
 
     return final_content 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\pdf_service.py === 
-# pdf_service.py
 """
-Phase 2: PDF parsing + structure detection.
+PDF parsing + structure detection.
 
-This module is pure logic (no DB, no FastAPI) so it's easy to test on its
-own. It takes a PDF file path and returns a nested tree of sections:
+Produces a nested tree of sections from a PDF path:
 
     {
       "page_count": int,
@@ -1903,62 +2014,147 @@ own. It takes a PDF file path and returns a nested tree of sections:
         {
           "title": str, "summary": None, "raw_text": str,
           "page_start": int, "page_end": int,
-          "children": [ ... same shape ... ]
+          "children": [ ... ]
         },
         ...
       ]
     }
 
-`summary` is always None here - Phase 3 fills it in with per-node LLM
-summaries. This module only figures out the document's structure.
-
-IMPORTANT (added after observing degenerate trees on SEC filings like
-10-K/10-Q): font-size-based heading detection can fail to find ANY
-section headers inside a document body (e.g. a filing whose only
-distinctly-larger text is the cover-page title). When that happens, the
-"heading" swallows the ENTIRE rest of the document into one giant
-raw_text blob with zero children - a single leaf node covering 50+ pages.
-Since retrieval only ever sends the first ~3000 chars of a leaf node's
-raw_text to the LLM, everything past the first page or two of that blob
-becomes invisible to retrieval, even though it's sitting right there in
-the DB.
-
-To fix this, _expand_oversized_leaves() walks the finished tree and, for
-any leaf node whose raw_text is larger than a threshold, replaces it with
-page-based sub-chunk children (same shape as the "no headings at all"
-fallback below) - so the tree-search can drill into the actual pages
-that matter instead of only ever seeing the start of a giant blob.
+Improvements for complex / scanned / large PDFs:
+1. OCR fallback (PyMuPDF built-in OCR) when a page has almost no extractable text.
+2. Table-aware text extraction that preserves row structure where possible.
+3. Character-based chunking fallback when heading detection fails or produces
+   a single giant leaf (in addition to the existing page-based expansion).
+4. Oversized-leaf expansion so retrieval can drill into multi-page blobs.
 """
 from collections import Counter
+from typing import Optional
 
-import pymupdf as fitz  # PyMuPDF (import name kept as `fitz` for readability below)
+import pymupdf as fitz
 
 MAX_HEADING_LEVELS = 4
 MAX_HEADING_WORDS = 20
 BOLD_HEADING_MAX_WORDS = 12
 PAGE_CHUNK_SIZE = 5
-
-# If a node's own raw_text is longer than this, it gets split into
-# page-based sub-chunks instead of being left as one giant leaf. Set
-# somewhat above CONTEXT_CHARS_PER_NODE (3000, in retrieval_agent.py /
-# multi_doc_service.py) so only genuinely oversized sections get split -
-# a normal-sized section that already fits in one context window is left
-# alone.
 MAX_LEAF_TEXT_CHARS = 4000
+# If a page yields fewer characters than this, try OCR
+MIN_CHARS_PER_PAGE_FOR_TEXT = 40
+# Character-based chunk size when we fall back to pure text chunking
+CHAR_CHUNK_SIZE = 2500
+CHAR_CHUNK_OVERLAP = 200
 
 
 def _is_bold_span(font_name: str, flags: int) -> bool:
-    return bool(flags & (1 << 4)) or "bold" in font_name.lower()
+    return bool(flags & (1 << 4)) or "bold" in (font_name or "").lower()
+
+
+def _extract_page_text_with_tables(page) -> str:
+    """
+    Prefer structured text that keeps table-like alignment.
+    Falls back to plain text if find_tables is unavailable or fails.
+    """
+    parts: list[str] = []
+
+    # Try table extraction first (PyMuPDF 1.23+)
+    try:
+        tabs = page.find_tables()
+        table_areas = []
+        if tabs and tabs.tables:
+            for tab in tabs.tables:
+                try:
+                    data = tab.extract()
+                    if data:
+                        rows = []
+                        for row in data:
+                            cells = [str(c).strip() if c is not None else "" for c in row]
+                            rows.append(" | ".join(cells))
+                        parts.append("\n".join(rows))
+                        if hasattr(tab, "bbox"):
+                            table_areas.append(tab.bbox)
+                except Exception:
+                    continue
+    except Exception:
+        table_areas = []
+
+    # Regular text blocks, skipping regions already covered by tables when possible
+    try:
+        blocks = page.get_text("blocks")
+        for b in blocks:
+            if len(b) < 5:
+                continue
+            x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4]
+            if not text or not str(text).strip():
+                continue
+            # Skip if this block is mostly inside a detected table
+            inside_table = False
+            for bbox in table_areas:
+                try:
+                    bx0, by0, bx1, by1 = bbox
+                    if x0 >= bx0 - 2 and y0 >= by0 - 2 and x1 <= bx1 + 2 and y1 <= by1 + 2:
+                        inside_table = True
+                        break
+                except Exception:
+                    pass
+            if not inside_table:
+                parts.append(str(text).strip())
+    except Exception:
+        # Ultimate fallback
+        plain = page.get_text("text") or ""
+        if plain.strip():
+            parts.append(plain.strip())
+
+    return "\n".join(parts).strip()
+
+
+def _ocr_page(page) -> str:
+    """
+    Attempt OCR on a page that has little or no extractable text.
+    Uses PyMuPDF's built-in OCR support when available (requires tesseract).
+    Returns empty string if OCR is not available or fails.
+    """
+    try:
+        # PyMuPDF OCR: get_textpage_ocr is available in recent versions
+        tp = page.get_textpage_ocr(language="eng", dpi=150, full=True)
+        text = page.get_text("text", textpage=tp) or ""
+        return text.strip()
+    except Exception:
+        try:
+            # Older / alternative path
+            text = page.get_text("text") or ""
+            return text.strip()
+        except Exception:
+            return ""
 
 
 def extract_lines(file_path: str) -> tuple[int, list[dict]]:
+    """
+    Extract per-line metadata (text, size, bold, page) for heading detection.
+    Also performs OCR fallback and table-aware extraction for content.
+    """
     doc = fitz.open(file_path)
     page_count = doc.page_count
     lines: list[dict] = []
+    # Also keep full page texts for character-chunk fallback later
+    page_texts: dict[int, str] = {}
 
     for page_index in range(page_count):
         page = doc[page_index]
-        page_dict = page.get_text("dict")
+        page_num = page_index + 1
+
+        # Structured / table-aware text for content
+        page_text = _extract_page_text_with_tables(page)
+        if len(page_text) < MIN_CHARS_PER_PAGE_FOR_TEXT:
+            ocr_text = _ocr_page(page)
+            if len(ocr_text) > len(page_text):
+                page_text = ocr_text
+
+        page_texts[page_num] = page_text
+
+        # Span-level extraction for heading detection (font size / bold)
+        try:
+            page_dict = page.get_text("dict")
+        except Exception:
+            page_dict = {"blocks": []}
 
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:
@@ -1971,7 +2167,9 @@ def extract_lines(file_path: str) -> tuple[int, list[dict]]:
                         continue
                     text_parts.append(text)
                     sizes.append(span.get("size", 0.0))
-                    bold_flags.append(_is_bold_span(span.get("font", ""), span.get("flags", 0)))
+                    bold_flags.append(
+                        _is_bold_span(span.get("font", ""), span.get("flags", 0))
+                    )
 
                 line_text = "".join(text_parts).strip()
                 if not line_text:
@@ -1981,10 +2179,25 @@ def extract_lines(file_path: str) -> tuple[int, list[dict]]:
                     "text": line_text,
                     "size": (sum(sizes) / len(sizes)) if sizes else 0.0,
                     "bold": all(bold_flags) if bold_flags else False,
-                    "page": page_index + 1,
+                    "page": page_num,
                 })
 
+        # If dict extraction produced no lines but we have page_text (e.g. OCR),
+        # synthesize one line so page-chunk fallback still has content.
+        if not any(l["page"] == page_num for l in lines) and page_text:
+            for para in page_text.split("\n"):
+                para = para.strip()
+                if para:
+                    lines.append({
+                        "text": para,
+                        "size": 11.0,
+                        "bold": False,
+                        "page": page_num,
+                    })
+
     doc.close()
+    # Stash page_texts on a module-level attribute so parse_pdf_to_tree can use them
+    extract_lines._last_page_texts = page_texts  # type: ignore[attr-defined]
     return page_count, lines
 
 
@@ -2035,8 +2248,6 @@ def _attach_direct_text(lines: list[dict], headings: list[dict]) -> None:
         text_lines = [lines[j]["text"] for j in range(start, end)]
         h["raw_text"] = "\n".join(text_lines).strip()
         h["page_end"] = lines[end - 1]["page"] if end > start else h["page"]
-        # Kept only for _expand_oversized_leaves() below - not part of the
-        # public tree shape, stripped before returning from parse_pdf_to_tree.
         h["_own_lines"] = lines[start:end]
 
 
@@ -2075,7 +2286,11 @@ def _build_page_chunks(lines: list[dict], page_count: int) -> list[dict]:
         chunk_text = "\n".join(
             l["text"] for l in lines if start_page <= l["page"] <= end_page
         ).strip()
-        title = f"Pages {start_page}-{end_page}" if end_page > start_page else f"Page {start_page}"
+        title = (
+            f"Pages {start_page}-{end_page}"
+            if end_page > start_page
+            else f"Page {start_page}"
+        )
         nodes.append({
             "title": title,
             "summary": None,
@@ -2087,13 +2302,65 @@ def _build_page_chunks(lines: list[dict], page_count: int) -> list[dict]:
     return nodes
 
 
-def _build_page_chunks_from_lines(own_lines: list[dict], page_start: int, page_end: int) -> list[dict]:
+def _build_char_chunks(
+    text: str,
+    page_start: int,
+    page_end: int,
+    title_prefix: str = "Section",
+) -> list[dict]:
     """
-    Same idea as _build_page_chunks(), but scoped to one oversized node's
-    own slice of lines/pages rather than the whole document. Used by
-    _expand_oversized_leaves() to break up a giant leaf into page-sized
-    children so retrieval can drill into it level by level.
+    Split a long text blob into overlapping character windows.
+    Used when heading detection fails or produces oversized leaves.
     """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if len(text) <= CHAR_CHUNK_SIZE:
+        return [{
+            "title": title_prefix,
+            "summary": None,
+            "raw_text": text,
+            "page_start": page_start,
+            "page_end": page_end,
+            "children": [],
+        }]
+
+    chunks = []
+    start = 0
+    idx = 1
+    while start < len(text):
+        end = min(start + CHAR_CHUNK_SIZE, len(text))
+        # Prefer to break at a paragraph or sentence boundary
+        if end < len(text):
+            break_at = text.rfind("\n\n", start, end)
+            if break_at < start + CHAR_CHUNK_SIZE // 2:
+                break_at = text.rfind(". ", start, end)
+            if break_at >= start + CHAR_CHUNK_SIZE // 2:
+                end = break_at + 1
+
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append({
+                "title": f"{title_prefix} (part {idx})",
+                "summary": None,
+                "raw_text": piece,
+                "page_start": page_start,
+                "page_end": page_end,
+                "children": [],
+            })
+            idx += 1
+
+        if end >= len(text):
+            break
+        start = max(end - CHAR_CHUNK_OVERLAP, start + 1)
+
+    return chunks
+
+
+def _build_page_chunks_from_lines(
+    own_lines: list[dict], page_start: int, page_end: int
+) -> list[dict]:
     if not own_lines or page_end < page_start:
         return []
 
@@ -2105,30 +2372,32 @@ def _build_page_chunks_from_lines(own_lines: list[dict], page_start: int, page_e
         ).strip()
         if not chunk_text:
             continue
-        title = f"Pages {chunk_start}-{chunk_end}" if chunk_end > chunk_start else f"Page {chunk_start}"
-        nodes.append({
-            "title": title,
-            "summary": None,
-            "raw_text": chunk_text,
-            "page_start": chunk_start,
-            "page_end": chunk_end,
-            "children": [],
-        })
+        title = (
+            f"Pages {chunk_start}-{chunk_end}"
+            if chunk_end > chunk_start
+            else f"Page {chunk_start}"
+        )
+        # If even a page-chunk is still huge, sub-split by characters
+        if len(chunk_text) > MAX_LEAF_TEXT_CHARS:
+            nodes.extend(
+                _build_char_chunks(chunk_text, chunk_start, chunk_end, title_prefix=title)
+            )
+        else:
+            nodes.append({
+                "title": title,
+                "summary": None,
+                "raw_text": chunk_text,
+                "page_start": chunk_start,
+                "page_end": chunk_end,
+                "children": [],
+            })
     return nodes
 
 
 def _expand_oversized_leaves(nodes: list[dict]) -> None:
     """
-    Recursively walks a tree (in place) and, for any LEAF node (no
-    children) whose raw_text is longer than MAX_LEAF_TEXT_CHARS, replaces
-    its children with page-based sub-chunks built from that node's own
-    lines. This is what prevents a single detected heading from silently
-    swallowing an entire multi-page document into one untouchable blob -
-    see the module docstring for why this matters.
-
-    The parent node's own raw_text is left as-is (still usable as a
-    fallback in retrieval_agent._walk() if none of the new children get
-    selected), only its children list is populated.
+    Recursively expand leaf nodes whose raw_text exceeds MAX_LEAF_TEXT_CHARS
+    into page-based (or character-based) children so retrieval can drill in.
     """
     for node in nodes:
         children = node.get("children") or []
@@ -2138,19 +2407,27 @@ def _expand_oversized_leaves(nodes: list[dict]) -> None:
 
         raw_text = node.get("raw_text") or ""
         own_lines = node.pop("_own_lines", None)
-        if len(raw_text) > MAX_LEAF_TEXT_CHARS and own_lines:
+
+        if len(raw_text) <= MAX_LEAF_TEXT_CHARS:
+            continue
+
+        if own_lines:
             sub_chunks = _build_page_chunks_from_lines(
                 own_lines, node["page_start"], node["page_end"]
             )
-            # Only worth it if this actually produces more than one chunk -
-            # a single-chunk result would just be the same blob again.
-            if len(sub_chunks) > 1:
-                node["children"] = sub_chunks
+        else:
+            sub_chunks = _build_char_chunks(
+                raw_text,
+                node["page_start"],
+                node["page_end"],
+                title_prefix=node.get("title") or "Section",
+            )
+
+        if len(sub_chunks) > 1:
+            node["children"] = sub_chunks
 
 
 def _strip_internal_keys(nodes: list[dict]) -> None:
-    """Removes the temporary _own_lines key left on any node that never
-    got expanded (e.g. it had children already, or wasn't oversized)."""
     for node in nodes:
         node.pop("_own_lines", None)
         if node.get("children"):
@@ -2167,40 +2444,35 @@ def parse_pdf_to_tree(file_path: str) -> dict:
         _expand_oversized_leaves(tree)
         _strip_internal_keys(tree)
     else:
+        # No headings detected - try page chunks first; if the whole doc
+        # is still one giant blob, character-chunk it.
         tree = _build_page_chunks(lines, page_count)
+        total_chars = sum(len(n.get("raw_text") or "") for n in tree)
+        if len(tree) <= 1 and total_chars > MAX_LEAF_TEXT_CHARS:
+            full_text = "\n".join(l["text"] for l in lines)
+            tree = _build_char_chunks(full_text, 1, page_count, title_prefix="Document")
 
     return {"page_count": page_count, "tree": tree} 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\reranker_service.py === 
-### backend/app/services/reranker_service.py
 """
-Phase 6 (Chunk 4), Step 4a: lightweight embedding-based reranker.
+Lightweight embedding-based reranker.
 
-The multi-document orchestrator (multi_doc_service.py) can end up with
-more collected nodes than we want to stuff into the final answer prompt
-(e.g. 18 nodes from 8 candidate documents). Previously these were simply
-truncated in whatever order the candidate documents happened to be
-processed in - not based on actual relevance.
+Scores collected (document, node) pairs by cosine similarity between the
+question embedding and each node's title+summary embedding, keeps top_n.
 
-This module replaces that naive cap with a real (but cheap) relevance
-ranking: embed the question once, embed each candidate node's
-title+summary (not the full raw_text - keeps embedding calls fast and
-node summaries are already a concise stand-in for the node's content),
-score by cosine similarity, and keep only the top N.
-
-Deliberately has NO LLM /api/chat call in it - only /api/embed calls,
-which are much cheaper and faster. This keeps reranking viable even when
-there are dozens of candidate nodes.
+Uses batched /api/embed calls so ranking 30-40 nodes is one (or a few)
+HTTP requests instead of dozens of sequential ones.
 """
-import asyncio
 import logging
 import math
+from typing import List, Tuple
 
 from app.models.models import Document, TreeNode
-from app.services.ollama_service import get_embedding
+from app.services.ollama_service import get_embedding, get_embeddings_batch
 
 logger = logging.getLogger("pageindex.reranker")
 
-DEFAULT_TOP_N = 8
+DEFAULT_TOP_N = 10
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -2214,10 +2486,8 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 def _node_embedding_text(node: TreeNode) -> str:
     """
-    What we actually embed for each node - title + summary, not the full
-    raw_text. Keeps embedding calls fast and consistent in size regardless
-    of how long a section's raw text is; the summary (from summary_service.py)
-    is already a compact stand-in for what the section covers.
+    What we embed for each node - title + summary, not the full raw_text.
+    Keeps embedding calls fast and consistent in size.
     """
     summary = node.summary or ""
     return f"{node.title}. {summary}".strip()
@@ -2225,16 +2495,14 @@ def _node_embedding_text(node: TreeNode) -> str:
 
 async def rerank_nodes(
     question: str,
-    nodes_with_documents: list[tuple[Document, TreeNode]],
+    nodes_with_documents: List[Tuple[Document, TreeNode]],
     top_n: int = DEFAULT_TOP_N,
-) -> list[tuple[Document, TreeNode]]:
+) -> List[Tuple[Document, TreeNode]]:
     """
-    Scores each (document, node) pair by cosine similarity between the
-    question's embedding and the node's title+summary embedding, and
-    returns the top_n highest-scoring pairs, sorted best-first.
+    Scores each (document, node) pair by cosine similarity and returns
+    the top_n highest-scoring pairs, sorted best-first.
 
-    If there are already <= top_n pairs, returns them unchanged (no need
-    to spend embedding calls ranking something that isn't being cut).
+    If there are already <= top_n pairs, returns them unchanged.
     """
     if len(nodes_with_documents) <= top_n:
         logger.info(
@@ -2243,14 +2511,13 @@ async def rerank_nodes(
         )
         return nodes_with_documents
 
-    logger.info("Reranking %d nodes down to top %d via embeddings", len(nodes_with_documents), top_n)
+    logger.info("Reranking %d nodes down to top %d via batch embeddings", len(nodes_with_documents), top_n)
 
     question_embedding = await get_embedding(question)
 
-    node_embeddings = await asyncio.gather(*[
-        get_embedding(_node_embedding_text(node))
-        for _, node in nodes_with_documents
-    ])
+    # Single batch call for all node texts
+    node_texts = [_node_embedding_text(node) for _, node in nodes_with_documents]
+    node_embeddings = await get_embeddings_batch(node_texts)
 
     scored = [
         (_cosine_similarity(question_embedding, node_emb), document, node)
@@ -2258,7 +2525,6 @@ async def rerank_nodes(
     ]
 
     scored.sort(key=lambda triple: triple[0], reverse=True)
-
     top = scored[:top_n]
 
     logger.info(
@@ -2269,37 +2535,26 @@ async def rerank_nodes(
 
     return [(document, node) for _, document, node in top] 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\retrieval_agent.py === 
-### retrieval_agent.py
-
 """
 Phase 4: tree-search retrieval agent.
 
-Given a question, this walks a single document's PageIndex tree top-down:
-  1. At the root level, ask the LLM which top-level sections (by title +
-     summary) might contain the answer.
-  2. For each selected section, recurse into its children and ask again -
-     narrowing down level by level instead of scanning the whole document.
-  3. Once a selected node has no children (or none of its children seem
-     relevant), its raw text is collected as context.
-  4. Once enough context is collected, ask the LLM to answer using ONLY
-     that collected text.
+Given a question, walks a single document's PageIndex tree top-down:
+  1. At the root level, select relevant sections (LLM + keyword boost).
+  2. For each selected section, recurse into children in PARALLEL.
+  3. Collect leaf (or fallback) raw text as context.
+  4. Deduplicate by node id so the same section is never collected twice.
 
-This is deliberately plain recursive Python (no LangGraph) per the
-project plan.
-
-Two entry points are exported:
-  - collect_relevant_nodes(): runs steps 1-3 only and returns the raw
-    TreeNode list, with NO LLM synthesis. This is the primitive the
-    multi-document orchestrators (multi_doc_service.py, graph.py) call
-    once per candidate document, so they can merge nodes across many
-    documents before doing ONE final synthesis over all of them.
-  - answer_question(): the original single-document entry point (steps
-    1-4) - collects nodes via collect_relevant_nodes() and then also
-    synthesizes a final answer, for callers that just want one document
-    answered on its own.
+Improvements over sequential version:
+- Sibling subtrees are traversed concurrently via asyncio.gather.
+- visited_ids set prevents duplicate collection.
+- Robust number parsing from LLM replies.
+- Root-level selection blends LLM picks with simple keyword overlap
+  so broad questions are less likely to drop a relevant branch.
 """
+import asyncio
 import logging
 import re
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -2309,7 +2564,7 @@ from app.services.ollama_service import chat_completion
 logger = logging.getLogger("pageindex.retrieval")
 
 MAX_SELECTIONS_PER_LEVEL = 3
-MAX_LEAF_NODES = 5
+MAX_LEAF_NODES = 6
 MAX_DEPTH = 6
 CONTEXT_CHARS_PER_NODE = 3000
 
@@ -2343,7 +2598,56 @@ def _build_children_map(nodes: list[TreeNode]) -> dict[str | None, list[TreeNode
     return children_map
 
 
-async def _select_relevant(question: str, candidates: list[TreeNode], level_label: str) -> list[TreeNode]:
+def _parse_selection_numbers(response: str, n_candidates: int) -> list[int]:
+    """
+    Robustly extract 1-based indices from an LLM reply.
+    Accepts '1,3', '1. 3', '[1, 2]', 'sections 1 and 3', etc.
+    Bounds-checks and preserves first-seen order.
+    """
+    numbers: list[int] = []
+    seen: set[int] = set()
+    for token in re.findall(r"\b\d+\b", response):
+        idx = int(token)
+        if 1 <= idx <= n_candidates and idx not in seen:
+            seen.add(idx)
+            numbers.append(idx)
+    return numbers
+
+
+def _keyword_overlap_score(question: str, node: TreeNode) -> float:
+    """
+    Cheap lexical overlap between question tokens and node title+summary+keywords.
+    Used as a safety net at root level so the LLM cannot completely drop
+    a section that clearly shares terms with the query.
+    """
+    q_tokens = set(re.findall(r"[a-z0-9]{3,}", question.lower()))
+    if not q_tokens:
+        return 0.0
+
+    blob_parts = [node.title or ""]
+    if node.summary:
+        blob_parts.append(node.summary)
+    if node.keywords:
+        try:
+            import json
+            kws = json.loads(node.keywords)
+            if isinstance(kws, list):
+                blob_parts.extend(str(k) for k in kws)
+        except Exception:
+            blob_parts.append(node.keywords)
+
+    blob = " ".join(blob_parts).lower()
+    hits = sum(1 for t in q_tokens if t in blob)
+    return hits / max(len(q_tokens), 1)
+
+
+async def _select_relevant(
+    question: str,
+    candidates: list[TreeNode],
+    level_label: str,
+    *,
+    is_root: bool = False,
+) -> list[TreeNode]:
     if not candidates:
         return []
 
@@ -2351,7 +2655,10 @@ async def _select_relevant(question: str, candidates: list[TreeNode], level_labe
         f"{i + 1}. {n.title} - {n.summary or '(no summary yet)'}"
         for i, n in enumerate(candidates)
     )
-    prompt = f"Question: {question}\n\nSections:\n{listing}\n\nWhich section numbers might contain the answer?"
+    prompt = (
+        f"Question: {question}\n\nSections:\n{listing}\n\n"
+        "Which section numbers might contain the answer?"
+    )
 
     logger.info(
         "[%s] Asking LLM to pick among %d candidates: %s",
@@ -2359,16 +2666,37 @@ async def _select_relevant(question: str, candidates: list[TreeNode], level_labe
     )
 
     response = await chat_completion(prompt=prompt, system=SELECTION_SYSTEM_PROMPT)
-
-    numbers = sorted(set(int(x) for x in re.findall(r"\d+", response)))
-    selected = [candidates[n - 1] for n in numbers if 1 <= n <= len(candidates)]
+    numbers = _parse_selection_numbers(response, len(candidates))
+    selected = [candidates[n - 1] for n in numbers]
     selected = selected[:MAX_SELECTIONS_PER_LEVEL]
+
+    # Root-level safety net: if LLM returned few/none, boost by keyword overlap
+    if is_root and len(selected) < MAX_SELECTIONS_PER_LEVEL:
+        scored = sorted(
+            (( _keyword_overlap_score(question, n), n) for n in candidates),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        already = {n.id for n in selected}
+        for score, node in scored:
+            if score < 0.15:
+                break
+            if node.id not in already:
+                selected.append(node)
+                already.add(node.id)
+                if len(selected) >= MAX_SELECTIONS_PER_LEVEL:
+                    break
+        if scored and scored[0][0] > 0:
+            logger.info(
+                "[%s] Keyword boost added sections: %s",
+                level_label,
+                [n.title for n in selected if n.id not in {candidates[i-1].id for i in numbers}],
+            )
 
     logger.info(
         "[%s] LLM raw reply=%r -> parsed_numbers=%s -> selected=%s",
         level_label, response, numbers, [n.title for n in selected],
     )
-
     return selected
 
 
@@ -2378,31 +2706,54 @@ async def _walk(
     children_map: dict[str | None, list[TreeNode]],
     depth: int,
     collected: list[TreeNode],
+    visited_ids: set[str],
+    lock: asyncio.Lock,
 ) -> None:
-    if len(collected) >= MAX_LEAF_NODES or depth > MAX_DEPTH:
-        return
+    async with lock:
+        if len(collected) >= MAX_LEAF_NODES or depth > MAX_DEPTH or node.id in visited_ids:
+            return
+        visited_ids.add(node.id)
 
     children = children_map.get(node.id, [])
     logger.info("[depth=%d] Visiting node %r (%d children)", depth, node.title, len(children))
 
     if not children:
-        logger.info("[depth=%d] Leaf node - collecting %r", depth, node.title)
-        collected.append(node)
+        async with lock:
+            if len(collected) < MAX_LEAF_NODES and node.id not in {n.id for n in collected}:
+                logger.info("[depth=%d] Leaf node - collecting %r", depth, node.title)
+                collected.append(node)
         return
 
-    selected_children = await _select_relevant(question, children, level_label=f"depth={depth}")
+    selected_children = await _select_relevant(
+        question, children, level_label=f"depth={depth}"
+    )
+
     if not selected_children:
-        if node.raw_text and node.raw_text.strip():
-            logger.info("[depth=%d] No relevant children - falling back to own text of %r", depth, node.title)
-            collected.append(node)
-        else:
-            logger.info("[depth=%d] No relevant children and no own text for %r - dropping branch", depth, node.title)
+        async with lock:
+            if (
+                node.raw_text
+                and node.raw_text.strip()
+                and len(collected) < MAX_LEAF_NODES
+                and node.id not in {n.id for n in collected}
+            ):
+                logger.info(
+                    "[depth=%d] No relevant children - falling back to own text of %r",
+                    depth, node.title,
+                )
+                collected.append(node)
+            else:
+                logger.info(
+                    "[depth=%d] No relevant children and no own text for %r - dropping branch",
+                    depth, node.title,
+                )
         return
 
-    for child in selected_children:
-        if len(collected) >= MAX_LEAF_NODES:
-            break
-        await _walk(question, child, children_map, depth + 1, collected)
+    # Parallel traversal of sibling branches
+    tasks = [
+        _walk(question, child, children_map, depth + 1, collected, visited_ids, lock)
+        for child in selected_children
+    ]
+    await asyncio.gather(*tasks)
 
 
 async def collect_relevant_nodes(
@@ -2412,16 +2763,8 @@ async def collect_relevant_nodes(
     nodes: list[TreeNode] | None = None,
 ) -> list[TreeNode]:
     """
-    Runs the tree-walk (steps 1-3 above) against ONE document and returns
-    the collected TreeNode rows relevant to `question` - no LLM synthesis,
-    no DB writes. This is what multi_doc_service.py and graph.py call once
-    per candidate document; they merge the results across every candidate
-    before doing a single final synthesis over all of them.
-
-    `nodes` lets a caller pass in an already-fetched list of this
-    document's TreeNode rows (avoids a duplicate query when the caller
-    already bulk-fetched them, e.g. multi_doc_service's
-    _fetch_nodes_by_document). If omitted, they're queried here.
+    Runs the tree-walk against ONE document and returns the collected
+    TreeNode rows relevant to `question` - no LLM synthesis.
     """
     if nodes is None:
         nodes = db.query(TreeNode).filter(TreeNode.document_id == document_id).all()
@@ -2433,25 +2776,41 @@ async def collect_relevant_nodes(
     children_map = _build_children_map(nodes)
     roots = children_map.get(None, [])
 
-    selected_roots = await _select_relevant(question, roots, level_label=f"doc={document_id} root")
+    selected_roots = await _select_relevant(
+        question, roots, level_label=f"doc={document_id} root", is_root=True
+    )
 
     collected: list[TreeNode] = []
-    for root in selected_roots:
-        if len(collected) >= MAX_LEAF_NODES:
-            break
-        await _walk(question, root, children_map, depth=1, collected=collected)
+    visited_ids: set[str] = set()
+    lock = asyncio.Lock()
+
+    # Parallel walk from each selected root
+    tasks = [
+        _walk(question, root, children_map, depth=1, collected=collected,
+              visited_ids=visited_ids, lock=lock)
+        for root in selected_roots
+    ]
+    await asyncio.gather(*tasks)
+
+    # Final dedup (defensive)
+    seen = set()
+    unique: list[TreeNode] = []
+    for n in collected:
+        if n.id not in seen:
+            seen.add(n.id)
+            unique.append(n)
 
     logger.info(
         "Document %s: collected %d node(s) for question %r: %s",
-        document_id, len(collected), question, [n.title for n in collected],
+        document_id, len(unique), question, [n.title for n in unique],
     )
-    return collected
+    return unique
 
 
 async def answer_question(db: Session, document_id: str, question: str) -> dict:
     """
-    Single-document entry point: collects relevant nodes for document_id
-    via collect_relevant_nodes(), then synthesizes one answer from them.
+    Single-document entry point: collects relevant nodes then synthesizes
+    one answer from them.
     """
     logger.info("=== New question for document %s: %r ===", document_id, question)
 
@@ -2479,7 +2838,10 @@ async def answer_question(db: Session, document_id: str, question: str) -> dict:
     context_blocks = []
     for n in collected:
         text = (n.raw_text or "").strip() or "(no direct text - see subsections)"
-        context_blocks.append(f"### {n.title} (pages {n.page_start}-{n.page_end})\n{text[:CONTEXT_CHARS_PER_NODE]}")
+        context_blocks.append(
+            f"### {n.title} (pages {n.page_start}-{n.page_end})\n"
+            f"{text[:CONTEXT_CHARS_PER_NODE]}"
+        )
     context = "\n\n".join(context_blocks)
 
     final_prompt = f"Document excerpts:\n\n{context}\n\nQuestion: {question}"
@@ -2488,13 +2850,17 @@ async def answer_question(db: Session, document_id: str, question: str) -> dict:
     return {"answer": answer, "cited_node_ids": [n.id for n in collected]} 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\summary_service.py === 
 """
-Phase 3 (extended in Phase 6): generates a short summary AND keywords for
-every TreeNode of a document, then rolls those up into one document-level
+Phase 3 (extended): generates a short summary AND keywords for every
+TreeNode of a document, then rolls those up into one document-level
 summary+keywords (used later for corpus-wide candidate narrowing).
 
-Runs bottom-up (children before parents) so a parent node with no direct
-text of its own gets summarized from its children's summaries instead of
-being left blank.
+Improvements:
+- Parallel summarization of independent nodes via asyncio.gather +
+  semaphore (max_concurrent_summaries) so a 30-node document no longer
+  takes 30 sequential LLM round-trips.
+- Robust keyword cleaning (strips bullets, newlines, special chars).
+- Sub-batched document rollup when there are more than MAX_ROOTS_FOR_ROLLUP
+  top-level sections (no more silent truncation of later sections).
 """
 import asyncio
 import json
@@ -2503,6 +2869,7 @@ import re
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import TreeNode, Document
 from app.services.ollama_service import chat_completion
 
@@ -2526,13 +2893,25 @@ DOC_ROLLUP_SYSTEM_PROMPT = (
 
 MAX_CONTENT_CHARS = 4000
 MAX_ROOTS_FOR_ROLLUP = 20
+ROLLUP_BATCH_SIZE = 15
+
+
+def _clean_keyword(raw: str) -> str:
+    """Strip bullets, numbering, quotes and excess whitespace from one keyword."""
+    k = raw.strip()
+    k = re.sub(r"^[\-\*\u2022\d\.\)\(]+\s*", "", k)
+    k = k.strip(" \t\"'`")
+    # Drop empty or pure-punctuation tokens
+    if not k or re.fullmatch(r"[\W_]+", k):
+        return ""
+    return k[:80]
 
 
 def _parse_summary_response(response: str) -> tuple[str, list[str]]:
     """
-    Robust line-based parser for the SUMMARY:/KEYWORDS: format above.
+    Robust line-based parser for the SUMMARY:/KEYWORDS: format.
     Falls back to treating the whole response as the summary if the model
-    doesn't follow the format at all.
+    doesn't follow the format at all. Keywords are aggressively cleaned.
     """
     summary = ""
     keywords: list[str] = []
@@ -2547,11 +2926,20 @@ def _parse_summary_response(response: str) -> tuple[str, list[str]]:
         elif lower.startswith("keyword"):
             _, _, rest = line.partition(":")
             raw = rest.strip()
-            parts = re.split(r"[;,]", raw)
-            keywords = [p.strip() for p in parts if p.strip()]
+            # Split on commas, semicolons, or newlines
+            parts = re.split(r"[;,\n]", raw)
+            keywords = [k for p in parts if (k := _clean_keyword(p))]
     if not summary:
-        summary = response.strip()
-    return summary, keywords
+        summary = response.strip()[:300]
+    # Deduplicate while preserving order
+    seen = set()
+    unique_kw = []
+    for k in keywords:
+        kl = k.lower()
+        if kl not in seen:
+            seen.add(kl)
+            unique_kw.append(k)
+    return summary, unique_kw[:12]
 
 
 def _build_children_map(nodes: list[TreeNode]) -> dict[str | None, list[TreeNode]]:
@@ -2563,7 +2951,11 @@ def _build_children_map(nodes: list[TreeNode]) -> dict[str | None, list[TreeNode
     return children_map
 
 
-async def _summarize_node(node: TreeNode, children_summaries: list[str]) -> dict:
+async def _summarize_node(
+    node: TreeNode,
+    children_summaries: list[str],
+    semaphore: asyncio.Semaphore,
+) -> dict:
     if node.raw_text and node.raw_text.strip():
         content = node.raw_text[:MAX_CONTENT_CHARS]
     elif children_summaries:
@@ -2572,7 +2964,10 @@ async def _summarize_node(node: TreeNode, children_summaries: list[str]) -> dict
         content = "(no content)"
 
     prompt = f"Section title: {node.title}\n\nContent:\n{content}"
-    response = await chat_completion(prompt=prompt, system=SUMMARY_SYSTEM_PROMPT)
+
+    async with semaphore:
+        response = await chat_completion(prompt=prompt, system=SUMMARY_SYSTEM_PROMPT)
+
     summary, keywords = _parse_summary_response(response)
     return {"summary": summary or node.title, "keywords": keywords}
 
@@ -2585,6 +2980,7 @@ async def _summarize_tree_async(db: Session, document_id: str) -> None:
     children_map = _build_children_map(nodes)
     by_id = {n.id: n for n in nodes}
     summaries: dict[str, str] = {}
+    semaphore = asyncio.Semaphore(getattr(settings, "max_concurrent_summaries", 4))
 
     def post_order(parent_id: str | None) -> list[str]:
         order = []
@@ -2595,16 +2991,58 @@ async def _summarize_tree_async(db: Session, document_id: str) -> None:
 
     ordered_ids = post_order(None)
 
-    for node_id in ordered_ids:
-        node = by_id[node_id]
-        child_summaries = [summaries[c.id] for c in children_map.get(node_id, [])]
-        result = await _summarize_node(node, child_summaries)
-        summaries[node_id] = result["summary"]
-        node.summary = result["summary"]
-        node.keywords = json.dumps(result["keywords"])
-        db.add(node)
+    # Process level-by-level in post-order batches of independent nodes.
+    # Nodes whose children are already summarized can run in parallel.
+    # We still respect post-order: a parent only runs after all its children.
+    remaining = set(ordered_ids)
+    completed: set[str] = set()
 
-    db.commit()
+    while remaining:
+        # A node is ready when all its children (that are in the tree) are done
+        ready = []
+        for nid in list(remaining):
+            child_ids = [c.id for c in children_map.get(nid, [])]
+            if all(cid in completed for cid in child_ids):
+                ready.append(nid)
+
+        if not ready:
+            # Safety: if dependency cycle somehow exists, finish remaining sequentially
+            ready = list(remaining)[: settings.max_concurrent_summaries]
+
+        async def _run_one(nid: str) -> tuple[str, dict]:
+            node = by_id[nid]
+            child_summaries = [
+                summaries[c.id]
+                for c in children_map.get(nid, [])
+                if c.id in summaries
+            ]
+            result = await _summarize_node(node, child_summaries, semaphore)
+            return nid, result
+
+        results = await asyncio.gather(*[_run_one(nid) for nid in ready])
+
+        for nid, result in results:
+            summaries[nid] = result["summary"]
+            node = by_id[nid]
+            node.summary = result["summary"]
+            node.keywords = json.dumps(result["keywords"])
+            db.add(node)
+            completed.add(nid)
+            remaining.discard(nid)
+
+        db.commit()
+        logger.info(
+            "Document %s: summarized %d/%d nodes",
+            document_id, len(completed), len(ordered_ids),
+        )
+
+
+async def _rollup_batch(section_listings: list[str]) -> tuple[str, list[str]]:
+    """Run one rollup LLM call over a list of 'title: summary' lines."""
+    listing = "\n".join(section_listings)
+    prompt = f"Section summaries:\n{listing}"
+    response = await chat_completion(prompt=prompt, system=DOC_ROLLUP_SYSTEM_PROMPT)
+    return _parse_summary_response(response)
 
 
 async def _generate_document_rollup(db: Session, document_id: str) -> None:
@@ -2612,17 +3050,31 @@ async def _generate_document_rollup(db: Session, document_id: str) -> None:
         db.query(TreeNode)
         .filter(TreeNode.document_id == document_id, TreeNode.parent_id.is_(None))
         .order_by(TreeNode.order_index)
-        .limit(MAX_ROOTS_FOR_ROLLUP)
         .all()
     )
     if not roots:
         return
 
-    listing = "\n".join(f"- {n.title}: {n.summary or '(no summary)'}" for n in roots)
-    prompt = f"Section summaries:\n{listing}"
+    listings = [
+        f"- {n.title}: {n.summary or '(no summary)'}"
+        for n in roots
+    ]
 
-    response = await chat_completion(prompt=prompt, system=DOC_ROLLUP_SYSTEM_PROMPT)
-    summary, keywords = _parse_summary_response(response)
+    if len(listings) <= MAX_ROOTS_FOR_ROLLUP:
+        summary, keywords = await _rollup_batch(listings)
+    else:
+        # Sub-batch: roll up groups of ROLLUP_BATCH_SIZE, then roll up the intermediates
+        logger.info(
+            "Document %s has %d roots (> %d) - using sub-batched rollup",
+            document_id, len(listings), MAX_ROOTS_FOR_ROLLUP,
+        )
+        intermediate: list[str] = []
+        for i in range(0, len(listings), ROLLUP_BATCH_SIZE):
+            chunk = listings[i : i + ROLLUP_BATCH_SIZE]
+            s, _ = await _rollup_batch(chunk)
+            intermediate.append(f"- Part {i // ROLLUP_BATCH_SIZE + 1}: {s}")
+
+        summary, keywords = await _rollup_batch(intermediate)
 
     document = db.query(Document).filter(Document.id == document_id).first()
     if document:
@@ -2630,7 +3082,10 @@ async def _generate_document_rollup(db: Session, document_id: str) -> None:
         document.keywords = json.dumps(keywords)
         db.add(document)
         db.commit()
-        logger.info("Document %s rollup: summary=%r keywords=%s", document_id, summary, keywords)
+        logger.info(
+            "Document %s rollup: summary=%r keywords=%s",
+            document_id, summary, keywords,
+        )
 
 
 def generate_summaries_for_document(db: Session, document_id: str) -> None:
@@ -2643,12 +3098,20 @@ def generate_summaries_for_document(db: Session, document_id: str) -> None:
 
     asyncio.run(_run()) 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\tree_service.py === 
-### tree_service.py
 """
 Persists the nested tree produced by pdf_service.parse_pdf_to_tree()
 into the `tree_nodes` table, preserving parent/child relationships and
 sibling order.
+
+Performance: generates UUIDs on the application side and prepares all
+TreeNode objects in memory, then adds them in one pass so SQLAlchemy
+can batch the INSERTs. This avoids the previous per-node db.flush()
+which issued one SQL round-trip per node on large trees.
 """
+import re
+import uuid
+from typing import Optional
+
 from sqlalchemy.orm import Session
 
 from app.models.models import TreeNode
@@ -2656,29 +3119,83 @@ from app.models.models import TreeNode
 MAX_TITLE_LENGTH = 500
 
 
-def persist_tree(
-    db: Session,
-    document_id: str,
+def _normalize_text(text: Optional[str]) -> Optional[str]:
+    """
+    Minimal whitespace cleanup before storing raw_text:
+    - Collapse runs of 3+ newlines into a double newline (paragraph break)
+    - Collapse runs of spaces/tabs into a single space
+    - Strip leading/trailing whitespace
+    Does NOT destroy meaningful structure (tables, lists).
+    """
+    if not text:
+        return text
+    # Normalize Windows/Mac newlines
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Collapse excessive blank lines
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    # Collapse horizontal whitespace runs (but keep single spaces)
+    text = re.sub(r"[ \t]+", " ", text)
+    # Clean spaces around newlines
+    text = re.sub(r" *\n *", "\n", text)
+    return text.strip()
+
+
+def _prepare_nodes(
     nodes: list[dict],
-    parent_id: str | None = None,
-) -> None:
+    document_id: str,
+    parent_id: Optional[str] = None,
+) -> list[TreeNode]:
+    """
+    Recursively walk the in-memory tree dicts and build TreeNode ORM
+    objects with pre-generated UUIDs so parent_id links are known
+    before any DB write.
+    """
+    prepared: list[TreeNode] = []
+
     for order_index, node in enumerate(nodes):
+        node_id = str(uuid.uuid4())
+        title = (node.get("title") or "Untitled")[:MAX_TITLE_LENGTH]
+        raw_text = _normalize_text(node.get("raw_text"))
+
         db_node = TreeNode(
+            id=node_id,
             document_id=document_id,
             parent_id=parent_id,
-            title=(node.get("title") or "Untitled")[:MAX_TITLE_LENGTH],
+            title=title,
             summary=node.get("summary"),
-            raw_text=node.get("raw_text"),
+            raw_text=raw_text,
             page_start=node.get("page_start"),
             page_end=node.get("page_end"),
             order_index=order_index,
         )
-        db.add(db_node)
-        db.flush()
+        prepared.append(db_node)
 
         children = node.get("children") or []
         if children:
-            persist_tree(db, document_id, children, parent_id=db_node.id) 
+            prepared.extend(
+                _prepare_nodes(children, document_id, parent_id=node_id)
+            )
+
+    return prepared
+
+
+def persist_tree(
+    db: Session,
+    document_id: str,
+    nodes: list[dict],
+    parent_id: Optional[str] = None,
+) -> None:
+    """
+    Convert the nested tree into TreeNode rows and insert them in a
+    single bulk operation (one commit by the caller is enough).
+    """
+    all_nodes = _prepare_nodes(nodes, document_id, parent_id=parent_id)
+    if not all_nodes:
+        return
+
+    # add_all lets SQLAlchemy batch the inserts efficiently
+    db.add_all(all_nodes)
+    db.flush()  # one flush for the whole tree, not per node 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\backend\app\services\__init__.py === 
  
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\vite.config.js === 
@@ -2756,7 +3273,7 @@ export default function App() {
     </Routes>
   );
 }
-
+ 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\main.jsx === 
 import React from "react";
 import ReactDOM from "react-dom/client";
@@ -2771,7 +3288,7 @@ ReactDOM.createRoot(document.getElementById("root")).render(
     </BrowserRouter>
   </React.StrictMode>
 );
-
+ 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\index.css === 
 :root {
   --bg: #0f1115;
@@ -3018,7 +3535,7 @@ input[type="text"] {
   padding-top: 12px;
   border-top: 1px solid var(--border);
 }
-
+ 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\api\client.js === 
 import axios from "axios";
 
@@ -3063,7 +3580,7 @@ export const sendMessage = (sessionId, content) =>
 export const listMessages = (sessionId) =>
   client.get(`/chat/sessions/${sessionId}/messages`);
 
-export default client;.
+export default client; 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\components\Layout.jsx === 
 import React from "react";
 import { NavLink, Outlet } from "react-router-dom";
@@ -3093,7 +3610,7 @@ export default function Layout() {
     </div>
   );
 }
-..
+ 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\components\TreeView.jsx === 
 import React, { useState } from "react";
 
@@ -3153,7 +3670,7 @@ export default function TreeView({ tree }) {
     </div>
   );
 }
-..
+ 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\pages\BatchesPage.jsx === 
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
@@ -3230,7 +3747,7 @@ export default function BatchesPage() {
     </div>
   );
 }
-..
+ 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\pages\ChatPage.jsx === 
 import React, { useEffect, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
@@ -3374,7 +3891,7 @@ export default function ChatPage() {
       </aside>
     </div>
   );
-}..
+} 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\pages\DocumentsPage.jsx === 
 import React, { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
@@ -3428,7 +3945,7 @@ export default function DocumentsPage() {
     </div>
   );
 }
-..
+ 
 === FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\frontend\src\pages\UploadPage.jsx === 
 import React, { useState } from "react";
 import { useNavigate } from "react-router-dom";
@@ -3507,4 +4024,46 @@ export default function UploadPage() {
     </div>
   );
 }
-..
+ 
+=== FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\Dockerfile === 
+# Stage 1: build the React frontend
+FROM node:20-alpine AS frontend-build
+WORKDIR /frontend
+COPY frontend/package.json ./
+RUN npm install
+COPY frontend/ .
+RUN npm run build
+
+# Stage 2: Python backend, with the built frontend copied in as static files
+FROM python:3.12-slim AS backend
+WORKDIR /app
+
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ .
+COPY --from=frontend-build /frontend/dist ./static
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 
+=== FILE: C:\Users\Dell\Documents\Custom Office Templates\pageindex-chatbot\Dockerfile === 
+# Stage 1: build the React frontend
+FROM node:20-alpine AS frontend-build
+WORKDIR /frontend
+COPY frontend/package.json ./
+RUN npm install
+COPY frontend/ .
+RUN npm run build
+
+# Stage 2: Python backend, with the built frontend copied in as static files
+FROM python:3.12-slim AS backend
+WORKDIR /app
+
+COPY backend/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+COPY backend/ .
+COPY --from=frontend-build /frontend/dist ./static
+
+EXPOSE 8000
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"] 

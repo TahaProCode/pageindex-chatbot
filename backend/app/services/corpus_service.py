@@ -1,50 +1,28 @@
-### backend/app/services/corpus_service.py
 """
-Phase 6 (Chunk 3), Step 2 (upgraded for 200-document scale, then again for
-batch scoping): corpus-wide candidate narrowing.
+Corpus-wide candidate narrowing, scoped to a single upload batch.
 
-When a user asks a question in "search across the batch" mode, we can't
-afford to run the full tree-search (collect_relevant_nodes) on every
-document in the batch - that's one or more Ollama calls PER DOCUMENT PER
-TREE LEVEL, which doesn't scale past a handful of files.
-
-Instead, this module does a cheap pass first: show the LLM every
-candidate document's rollup summary + keywords (generated in Chunk 2 by
-summary_service.py) and ask which documents are even worth searching for
-this question. Only those "candidate" documents go on to the real
-per-document tree-search in the next step (multi-doc orchestrator).
-
-IMPORTANT: narrowing is now scoped to a single batch_id. A batch is the
-set of documents a user uploaded together and is chatting with as one
-unit - documents from OTHER batches must never leak into this search,
-even if they're both "ready". Without this filter, a 10-document batch
-would get its candidates diluted (or replaced) by unrelated documents
-from a different 200-document batch sitting in the same table.
-
-Only documents with status == ready are considered, since summary/
-keywords/tree nodes don't exist yet for documents still indexing.
+When a user asks a question we cannot afford full tree-search on every
+document. This module does a cheap pass first using document-level
+summary + keywords, then (if the LLM finds nothing) falls back to a
+simple BM25-style keyword ranking so we never silently return "most
+recent documents" that have nothing to do with the query.
 """
 import asyncio
 import json
 import logging
+import math
 import re
+from collections import Counter
 
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.models.models import Document, DocumentStatus
 from app.services.ollama_service import chat_completion
 
 logger = logging.getLogger("pageindex.corpus")
 
-# How many candidate documents to hand off to the per-document tree-search
-# (Step 4 in the pipeline). 10-20 chosen so that even if a couple of true
-# positives get missed by the LLM narrowing pass, there's enough headroom
-# for the answer to still be found among the survivors.
 MAX_CANDIDATE_DOCUMENTS = 15
-
-# How many documents go into ONE narrowing prompt. Keeps each individual
-# LLM call's listing short enough for a 4B model to reason over reliably.
-# e.g. 200 documents / 40 per batch = 5 LLM calls, run in parallel.
 DOCUMENTS_PER_BATCH = 40
 
 CANDIDATE_SELECTION_SYSTEM_PROMPT = (
@@ -74,26 +52,91 @@ def _format_document_listing(documents: list[Document]) -> str:
         keywords = _parse_keywords(doc.keywords)
         keywords_str = ", ".join(keywords) if keywords else "(none)"
         summary = doc.summary or "(no summary available)"
-        lines.append(f"{i + 1}. {doc.filename}\n   Summary: {summary}\n   Keywords: {keywords_str}")
+        lines.append(
+            f"{i + 1}. {doc.filename}\n   Summary: {summary}\n   Keywords: {keywords_str}"
+        )
     return "\n".join(lines)
 
 
 def _chunk_list(items: list, size: int) -> list[list]:
-    return [items[i:i + size] for i in range(0, len(items), size)]
+    return [items[i : i + size] for i in range(0, len(items), size)]
 
 
-async def _narrow_one_batch(question: str, batch: list[Document], batch_label: str) -> list[Document]:
+def _tokenize(text: str) -> list[str]:
+    return re.findall(r"[a-z0-9]{2,}", (text or "").lower())
+
+
+def _bm25_rank(
+    question: str,
+    documents: list[Document],
+    top_n: int,
+) -> list[Document]:
     """
-    Runs the narrowing prompt on a single LLM-call-sized batch of documents
-    (<= DOCUMENTS_PER_BATCH) and returns the Document rows from THIS batch
-    that the LLM picked.
-
-    Note: this is an internal chunking batch for the LLM prompt, distinct
-    from the user-facing upload Batch (models.Batch) - a single upload
-    Batch of e.g. 200 documents gets split into several of these here.
+    Lightweight BM25-inspired ranking over document filename + summary + keywords.
+    Used as fallback when the LLM narrowing returns nothing relevant.
     """
+    query_tokens = _tokenize(question)
+    if not query_tokens or not documents:
+        return documents[:top_n]
+
+    # Document "text" for scoring
+    doc_texts = []
+    for doc in documents:
+        parts = [doc.filename or ""]
+        if doc.summary:
+            parts.append(doc.summary)
+        kws = _parse_keywords(doc.keywords)
+        parts.extend(kws)
+        doc_texts.append(" ".join(parts))
+
+    tokenized_docs = [_tokenize(t) for t in doc_texts]
+    doc_lens = [len(td) or 1 for td in tokenized_docs]
+    avgdl = sum(doc_lens) / len(doc_lens)
+
+    # Document frequency
+    df: Counter = Counter()
+    for td in tokenized_docs:
+        df.update(set(td))
+
+    N = len(documents)
+    k1 = 1.5
+    b = 0.75
+
+    scores = []
+    for i, td in enumerate(tokenized_docs):
+        tf = Counter(td)
+        score = 0.0
+        for qt in query_tokens:
+            if qt not in tf:
+                continue
+            idf = math.log(1 + (N - df[qt] + 0.5) / (df[qt] + 0.5))
+            freq = tf[qt]
+            denom = freq + k1 * (1 - b + b * doc_lens[i] / avgdl)
+            score += idf * (freq * (k1 + 1)) / denom
+        scores.append((score, documents[i]))
+
+    scores.sort(key=lambda x: x[0], reverse=True)
+    ranked = [doc for sc, doc in scores if sc > 0][:top_n]
+
+    logger.info(
+        "BM25 fallback ranked %d docs (top scores): %s",
+        len(ranked),
+        [(round(sc, 3), d.filename) for sc, d in scores[:5]],
+    )
+    # If BM25 found nothing, fall back to most recent as last resort
+    if not ranked:
+        return documents[:top_n]
+    return ranked
+
+
+async def _narrow_one_batch(
+    question: str, batch: list[Document], batch_label: str
+) -> list[Document]:
     listing = _format_document_listing(batch)
-    prompt = f"Question: {question}\n\nDocuments:\n{listing}\n\nWhich document numbers might contain the answer?"
+    prompt = (
+        f"Question: {question}\n\nDocuments:\n{listing}\n\n"
+        "Which document numbers might contain the answer?"
+    )
 
     logger.info(
         "[%s] Asking LLM to narrow among %d documents: %s",
@@ -102,14 +145,13 @@ async def _narrow_one_batch(question: str, batch: list[Document], batch_label: s
 
     response = await chat_completion(prompt=prompt, system=CANDIDATE_SELECTION_SYSTEM_PROMPT)
 
-    numbers = sorted(set(int(x) for x in re.findall(r"\d+", response)))
+    numbers = sorted(set(int(x) for x in re.findall(r"\b\d+\b", response)))
     selected = [batch[n - 1] for n in numbers if 1 <= n <= len(batch)]
 
     logger.info(
         "[%s] LLM raw reply=%r -> parsed_numbers=%s -> picked=%s",
         batch_label, response, numbers, [d.filename for d in selected],
     )
-
     return selected
 
 
@@ -117,23 +159,15 @@ async def narrow_candidate_documents(
     db: Session,
     question: str,
     batch_id: str,
-    max_candidates: int = MAX_CANDIDATE_DOCUMENTS,
+    max_candidates: int | None = None,
     documents_per_batch: int = DOCUMENTS_PER_BATCH,
 ) -> list[Document]:
     """
     Returns a shortlist of Document rows worth running the full tree-search
-    on for this question, using only their rollup summary+keywords.
-
-    Scoped to a single upload-batch (batch_id) - documents from any other
-    batch are never considered, no matter how many total documents exist
-    in the system.
-
-    For batches larger than `documents_per_batch`, documents are split
-    into LLM-call-sized chunks and narrowed in parallel (one LLM call per
-    chunk, not one call for the whole batch) - this keeps each prompt
-    short and lets narrowing scale to hundreds of documents without the
-    accuracy hit of one giant list.
+    on for this question, scoped to a single upload-batch.
     """
+    max_candidates = max_candidates or settings.max_candidate_documents
+
     documents = (
         db.query(Document)
         .filter(Document.batch_id == batch_id, Document.status == DocumentStatus.ready)
@@ -160,13 +194,14 @@ async def narrow_candidate_documents(
     )
 
     chunk_results = await asyncio.gather(*[
-        _narrow_one_batch(question, chunk, batch_label=f"batch={batch_id} chunk={i + 1}/{len(chunks)}")
+        _narrow_one_batch(
+            question, chunk,
+            batch_label=f"batch={batch_id} chunk={i + 1}/{len(chunks)}",
+        )
         for i, chunk in enumerate(chunks)
     ])
 
-    # Merge picks from all chunks, preserving order and de-duplicating
-    # (a document can only appear in one chunk anyway, but stay safe).
-    seen_ids = set()
+    seen_ids: set[str] = set()
     merged: list[Document] = []
     for chunk_selected in chunk_results:
         for doc in chunk_selected:
@@ -180,17 +215,16 @@ async def narrow_candidate_documents(
     )
 
     if not merged:
+        # BM25 / keyword ranking fallback instead of blind "most recent"
         logger.info(
-            "LLM found no relevant documents in any chunk - falling back to "
-            "most recent %d in this batch as a safety net", max_candidates,
+            "LLM found no relevant documents - applying BM25 keyword ranking fallback"
         )
-        return documents[:max_candidates]
+        return _bm25_rank(question, documents, max_candidates)
 
     if len(merged) > max_candidates:
         logger.info(
-            "Merged candidates (%d) exceed max_candidates (%d) - truncating "
-            "to the %d most recently created among them",
-            len(merged), max_candidates, max_candidates,
+            "Merged candidates (%d) exceed max_candidates (%d) - truncating",
+            len(merged), max_candidates,
         )
         merged = merged[:max_candidates]
 

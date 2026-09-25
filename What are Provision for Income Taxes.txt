@@ -1,0 +1,38 @@
+What are Provision for Income Taxes
+What are Fair Value Hedges
+What are Share Repurchases
+What are Advertising Revenues and Cost of Revenues
+
+1.Comp;ex query will be partionized 
+2.Documents narrowing 
+3.Down to top tree search 
+4.Reranking through cosine similarity 
+5.COmpletness check thorugh agentic loop max 3 times 
+6.Final Answer
+
+
+1. Query Decomposition / Multi-Query Generation (Query ko Todna)
+User ki ek single query 10-15 files ke context ko ek sath hit nahi kar sakti.
+
+Tareeqay-kar: Jab user query kare, toh sabse pehle LLM se us query ko 3 se 5 choti sub-queries mein break karwayein.
+
+Fayda: Har sub-query alag alag files se relevant chunks uthayegi, jisse wo 10-15 files wala bikhra hua data easily fetch ho jayega.
+
+2. Document-Level Metadata & Summaries (Index Level)
+Agar answer alag alag files mein baata hua hai, toh LLM ko har file ke high-level context ka pata hona chahiye.
+
+Tareeqay-kar: Har file ka ek chota sa Summary Chunk aur Keywords/Topics pehle se bana kar Vector DB mein save karein.
+
+Fayda: Search karte waqt pehle relevant files identify hongi, phir un files ke andar se specific chunks extract honge.
+
+3. Re-Ranking (Cross-Encoder / Cohere Rerank) — Sabse Crucial Step
+Vector search (Cosine Similarity) sirf surface-level matching karta hai.
+
+Tareeqay-kar: Vector Search se aap Top 30 ya Top 40 Chunks nikalein. Uske baad ek Re-ranker Model (bge-reranker-large ya Cohere Rerank) lagayein.
+
+Fayda: Re-ranker deep semantic check karta hai aur un tamam 30-40 chunks mein se sirf wo 10-12 chunks top par le aata hai jo user ke bikhre hue sawal se asli relation rakhte hain.
+
+4. Contextual Retrieval / Parent-Document Retriever
+Chote chunks se context adhoora reh jata hai.
+
+Tareeqay-kar: Search hamesha chote chunk (200-300 tokens) par karein, lekin jab LLM ko bhejney ki bari aaye toh poora Parent Block / Page bhejain.

@@ -1,9 +1,7 @@
-# pdf_service.py
 """
-Phase 2: PDF parsing + structure detection.
+PDF parsing + structure detection.
 
-This module is pure logic (no DB, no FastAPI) so it's easy to test on its
-own. It takes a PDF file path and returns a nested tree of sections:
+Produces a nested tree of sections from a PDF path:
 
     {
       "page_count": int,
@@ -11,62 +9,147 @@ own. It takes a PDF file path and returns a nested tree of sections:
         {
           "title": str, "summary": None, "raw_text": str,
           "page_start": int, "page_end": int,
-          "children": [ ... same shape ... ]
+          "children": [ ... ]
         },
         ...
       ]
     }
 
-`summary` is always None here - Phase 3 fills it in with per-node LLM
-summaries. This module only figures out the document's structure.
-
-IMPORTANT (added after observing degenerate trees on SEC filings like
-10-K/10-Q): font-size-based heading detection can fail to find ANY
-section headers inside a document body (e.g. a filing whose only
-distinctly-larger text is the cover-page title). When that happens, the
-"heading" swallows the ENTIRE rest of the document into one giant
-raw_text blob with zero children - a single leaf node covering 50+ pages.
-Since retrieval only ever sends the first ~3000 chars of a leaf node's
-raw_text to the LLM, everything past the first page or two of that blob
-becomes invisible to retrieval, even though it's sitting right there in
-the DB.
-
-To fix this, _expand_oversized_leaves() walks the finished tree and, for
-any leaf node whose raw_text is larger than a threshold, replaces it with
-page-based sub-chunk children (same shape as the "no headings at all"
-fallback below) - so the tree-search can drill into the actual pages
-that matter instead of only ever seeing the start of a giant blob.
+Improvements for complex / scanned / large PDFs:
+1. OCR fallback (PyMuPDF built-in OCR) when a page has almost no extractable text.
+2. Table-aware text extraction that preserves row structure where possible.
+3. Character-based chunking fallback when heading detection fails or produces
+   a single giant leaf (in addition to the existing page-based expansion).
+4. Oversized-leaf expansion so retrieval can drill into multi-page blobs.
 """
 from collections import Counter
+from typing import Optional
 
-import pymupdf as fitz  # PyMuPDF (import name kept as `fitz` for readability below)
+import pymupdf as fitz
 
 MAX_HEADING_LEVELS = 4
 MAX_HEADING_WORDS = 20
 BOLD_HEADING_MAX_WORDS = 12
 PAGE_CHUNK_SIZE = 5
-
-# If a node's own raw_text is longer than this, it gets split into
-# page-based sub-chunks instead of being left as one giant leaf. Set
-# somewhat above CONTEXT_CHARS_PER_NODE (3000, in retrieval_agent.py /
-# multi_doc_service.py) so only genuinely oversized sections get split -
-# a normal-sized section that already fits in one context window is left
-# alone.
 MAX_LEAF_TEXT_CHARS = 4000
+# If a page yields fewer characters than this, try OCR
+MIN_CHARS_PER_PAGE_FOR_TEXT = 40
+# Character-based chunk size when we fall back to pure text chunking
+CHAR_CHUNK_SIZE = 2500
+CHAR_CHUNK_OVERLAP = 200
 
 
 def _is_bold_span(font_name: str, flags: int) -> bool:
-    return bool(flags & (1 << 4)) or "bold" in font_name.lower()
+    return bool(flags & (1 << 4)) or "bold" in (font_name or "").lower()
+
+
+def _extract_page_text_with_tables(page) -> str:
+    """
+    Prefer structured text that keeps table-like alignment.
+    Falls back to plain text if find_tables is unavailable or fails.
+    """
+    parts: list[str] = []
+
+    # Try table extraction first (PyMuPDF 1.23+)
+    try:
+        tabs = page.find_tables()
+        table_areas = []
+        if tabs and tabs.tables:
+            for tab in tabs.tables:
+                try:
+                    data = tab.extract()
+                    if data:
+                        rows = []
+                        for row in data:
+                            cells = [str(c).strip() if c is not None else "" for c in row]
+                            rows.append(" | ".join(cells))
+                        parts.append("\n".join(rows))
+                        if hasattr(tab, "bbox"):
+                            table_areas.append(tab.bbox)
+                except Exception:
+                    continue
+    except Exception:
+        table_areas = []
+
+    # Regular text blocks, skipping regions already covered by tables when possible
+    try:
+        blocks = page.get_text("blocks")
+        for b in blocks:
+            if len(b) < 5:
+                continue
+            x0, y0, x1, y1, text = b[0], b[1], b[2], b[3], b[4]
+            if not text or not str(text).strip():
+                continue
+            # Skip if this block is mostly inside a detected table
+            inside_table = False
+            for bbox in table_areas:
+                try:
+                    bx0, by0, bx1, by1 = bbox
+                    if x0 >= bx0 - 2 and y0 >= by0 - 2 and x1 <= bx1 + 2 and y1 <= by1 + 2:
+                        inside_table = True
+                        break
+                except Exception:
+                    pass
+            if not inside_table:
+                parts.append(str(text).strip())
+    except Exception:
+        # Ultimate fallback
+        plain = page.get_text("text") or ""
+        if plain.strip():
+            parts.append(plain.strip())
+
+    return "\n".join(parts).strip()
+
+
+def _ocr_page(page) -> str:
+    """
+    Attempt OCR on a page that has little or no extractable text.
+    Uses PyMuPDF's built-in OCR support when available (requires tesseract).
+    Returns empty string if OCR is not available or fails.
+    """
+    try:
+        # PyMuPDF OCR: get_textpage_ocr is available in recent versions
+        tp = page.get_textpage_ocr(language="eng", dpi=150, full=True)
+        text = page.get_text("text", textpage=tp) or ""
+        return text.strip()
+    except Exception:
+        try:
+            # Older / alternative path
+            text = page.get_text("text") or ""
+            return text.strip()
+        except Exception:
+            return ""
 
 
 def extract_lines(file_path: str) -> tuple[int, list[dict]]:
+    """
+    Extract per-line metadata (text, size, bold, page) for heading detection.
+    Also performs OCR fallback and table-aware extraction for content.
+    """
     doc = fitz.open(file_path)
     page_count = doc.page_count
     lines: list[dict] = []
+    # Also keep full page texts for character-chunk fallback later
+    page_texts: dict[int, str] = {}
 
     for page_index in range(page_count):
         page = doc[page_index]
-        page_dict = page.get_text("dict")
+        page_num = page_index + 1
+
+        # Structured / table-aware text for content
+        page_text = _extract_page_text_with_tables(page)
+        if len(page_text) < MIN_CHARS_PER_PAGE_FOR_TEXT:
+            ocr_text = _ocr_page(page)
+            if len(ocr_text) > len(page_text):
+                page_text = ocr_text
+
+        page_texts[page_num] = page_text
+
+        # Span-level extraction for heading detection (font size / bold)
+        try:
+            page_dict = page.get_text("dict")
+        except Exception:
+            page_dict = {"blocks": []}
 
         for block in page_dict.get("blocks", []):
             if block.get("type") != 0:
@@ -79,7 +162,9 @@ def extract_lines(file_path: str) -> tuple[int, list[dict]]:
                         continue
                     text_parts.append(text)
                     sizes.append(span.get("size", 0.0))
-                    bold_flags.append(_is_bold_span(span.get("font", ""), span.get("flags", 0)))
+                    bold_flags.append(
+                        _is_bold_span(span.get("font", ""), span.get("flags", 0))
+                    )
 
                 line_text = "".join(text_parts).strip()
                 if not line_text:
@@ -89,10 +174,25 @@ def extract_lines(file_path: str) -> tuple[int, list[dict]]:
                     "text": line_text,
                     "size": (sum(sizes) / len(sizes)) if sizes else 0.0,
                     "bold": all(bold_flags) if bold_flags else False,
-                    "page": page_index + 1,
+                    "page": page_num,
                 })
 
+        # If dict extraction produced no lines but we have page_text (e.g. OCR),
+        # synthesize one line so page-chunk fallback still has content.
+        if not any(l["page"] == page_num for l in lines) and page_text:
+            for para in page_text.split("\n"):
+                para = para.strip()
+                if para:
+                    lines.append({
+                        "text": para,
+                        "size": 11.0,
+                        "bold": False,
+                        "page": page_num,
+                    })
+
     doc.close()
+    # Stash page_texts on a module-level attribute so parse_pdf_to_tree can use them
+    extract_lines._last_page_texts = page_texts  # type: ignore[attr-defined]
     return page_count, lines
 
 
@@ -143,8 +243,6 @@ def _attach_direct_text(lines: list[dict], headings: list[dict]) -> None:
         text_lines = [lines[j]["text"] for j in range(start, end)]
         h["raw_text"] = "\n".join(text_lines).strip()
         h["page_end"] = lines[end - 1]["page"] if end > start else h["page"]
-        # Kept only for _expand_oversized_leaves() below - not part of the
-        # public tree shape, stripped before returning from parse_pdf_to_tree.
         h["_own_lines"] = lines[start:end]
 
 
@@ -183,7 +281,11 @@ def _build_page_chunks(lines: list[dict], page_count: int) -> list[dict]:
         chunk_text = "\n".join(
             l["text"] for l in lines if start_page <= l["page"] <= end_page
         ).strip()
-        title = f"Pages {start_page}-{end_page}" if end_page > start_page else f"Page {start_page}"
+        title = (
+            f"Pages {start_page}-{end_page}"
+            if end_page > start_page
+            else f"Page {start_page}"
+        )
         nodes.append({
             "title": title,
             "summary": None,
@@ -195,13 +297,65 @@ def _build_page_chunks(lines: list[dict], page_count: int) -> list[dict]:
     return nodes
 
 
-def _build_page_chunks_from_lines(own_lines: list[dict], page_start: int, page_end: int) -> list[dict]:
+def _build_char_chunks(
+    text: str,
+    page_start: int,
+    page_end: int,
+    title_prefix: str = "Section",
+) -> list[dict]:
     """
-    Same idea as _build_page_chunks(), but scoped to one oversized node's
-    own slice of lines/pages rather than the whole document. Used by
-    _expand_oversized_leaves() to break up a giant leaf into page-sized
-    children so retrieval can drill into it level by level.
+    Split a long text blob into overlapping character windows.
+    Used when heading detection fails or produces oversized leaves.
     """
+    text = (text or "").strip()
+    if not text:
+        return []
+
+    if len(text) <= CHAR_CHUNK_SIZE:
+        return [{
+            "title": title_prefix,
+            "summary": None,
+            "raw_text": text,
+            "page_start": page_start,
+            "page_end": page_end,
+            "children": [],
+        }]
+
+    chunks = []
+    start = 0
+    idx = 1
+    while start < len(text):
+        end = min(start + CHAR_CHUNK_SIZE, len(text))
+        # Prefer to break at a paragraph or sentence boundary
+        if end < len(text):
+            break_at = text.rfind("\n\n", start, end)
+            if break_at < start + CHAR_CHUNK_SIZE // 2:
+                break_at = text.rfind(". ", start, end)
+            if break_at >= start + CHAR_CHUNK_SIZE // 2:
+                end = break_at + 1
+
+        piece = text[start:end].strip()
+        if piece:
+            chunks.append({
+                "title": f"{title_prefix} (part {idx})",
+                "summary": None,
+                "raw_text": piece,
+                "page_start": page_start,
+                "page_end": page_end,
+                "children": [],
+            })
+            idx += 1
+
+        if end >= len(text):
+            break
+        start = max(end - CHAR_CHUNK_OVERLAP, start + 1)
+
+    return chunks
+
+
+def _build_page_chunks_from_lines(
+    own_lines: list[dict], page_start: int, page_end: int
+) -> list[dict]:
     if not own_lines or page_end < page_start:
         return []
 
@@ -213,30 +367,32 @@ def _build_page_chunks_from_lines(own_lines: list[dict], page_start: int, page_e
         ).strip()
         if not chunk_text:
             continue
-        title = f"Pages {chunk_start}-{chunk_end}" if chunk_end > chunk_start else f"Page {chunk_start}"
-        nodes.append({
-            "title": title,
-            "summary": None,
-            "raw_text": chunk_text,
-            "page_start": chunk_start,
-            "page_end": chunk_end,
-            "children": [],
-        })
+        title = (
+            f"Pages {chunk_start}-{chunk_end}"
+            if chunk_end > chunk_start
+            else f"Page {chunk_start}"
+        )
+        # If even a page-chunk is still huge, sub-split by characters
+        if len(chunk_text) > MAX_LEAF_TEXT_CHARS:
+            nodes.extend(
+                _build_char_chunks(chunk_text, chunk_start, chunk_end, title_prefix=title)
+            )
+        else:
+            nodes.append({
+                "title": title,
+                "summary": None,
+                "raw_text": chunk_text,
+                "page_start": chunk_start,
+                "page_end": chunk_end,
+                "children": [],
+            })
     return nodes
 
 
 def _expand_oversized_leaves(nodes: list[dict]) -> None:
     """
-    Recursively walks a tree (in place) and, for any LEAF node (no
-    children) whose raw_text is longer than MAX_LEAF_TEXT_CHARS, replaces
-    its children with page-based sub-chunks built from that node's own
-    lines. This is what prevents a single detected heading from silently
-    swallowing an entire multi-page document into one untouchable blob -
-    see the module docstring for why this matters.
-
-    The parent node's own raw_text is left as-is (still usable as a
-    fallback in retrieval_agent._walk() if none of the new children get
-    selected), only its children list is populated.
+    Recursively expand leaf nodes whose raw_text exceeds MAX_LEAF_TEXT_CHARS
+    into page-based (or character-based) children so retrieval can drill in.
     """
     for node in nodes:
         children = node.get("children") or []
@@ -246,19 +402,27 @@ def _expand_oversized_leaves(nodes: list[dict]) -> None:
 
         raw_text = node.get("raw_text") or ""
         own_lines = node.pop("_own_lines", None)
-        if len(raw_text) > MAX_LEAF_TEXT_CHARS and own_lines:
+
+        if len(raw_text) <= MAX_LEAF_TEXT_CHARS:
+            continue
+
+        if own_lines:
             sub_chunks = _build_page_chunks_from_lines(
                 own_lines, node["page_start"], node["page_end"]
             )
-            # Only worth it if this actually produces more than one chunk -
-            # a single-chunk result would just be the same blob again.
-            if len(sub_chunks) > 1:
-                node["children"] = sub_chunks
+        else:
+            sub_chunks = _build_char_chunks(
+                raw_text,
+                node["page_start"],
+                node["page_end"],
+                title_prefix=node.get("title") or "Section",
+            )
+
+        if len(sub_chunks) > 1:
+            node["children"] = sub_chunks
 
 
 def _strip_internal_keys(nodes: list[dict]) -> None:
-    """Removes the temporary _own_lines key left on any node that never
-    got expanded (e.g. it had children already, or wasn't oversized)."""
     for node in nodes:
         node.pop("_own_lines", None)
         if node.get("children"):
@@ -275,6 +439,12 @@ def parse_pdf_to_tree(file_path: str) -> dict:
         _expand_oversized_leaves(tree)
         _strip_internal_keys(tree)
     else:
+        # No headings detected - try page chunks first; if the whole doc
+        # is still one giant blob, character-chunk it.
         tree = _build_page_chunks(lines, page_count)
+        total_chars = sum(len(n.get("raw_text") or "") for n in tree)
+        if len(tree) <= 1 and total_chars > MAX_LEAF_TEXT_CHARS:
+            full_text = "\n".join(l["text"] for l in lines)
+            tree = _build_char_chunks(full_text, 1, page_count, title_prefix="Document")
 
     return {"page_count": page_count, "tree": tree}

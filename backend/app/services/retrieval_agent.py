@@ -1,34 +1,23 @@
-### retrieval_agent.py
-
 """
 Phase 4: tree-search retrieval agent.
 
-Given a question, this walks a single document's PageIndex tree top-down:
-  1. At the root level, ask the LLM which top-level sections (by title +
-     summary) might contain the answer.
-  2. For each selected section, recurse into its children and ask again -
-     narrowing down level by level instead of scanning the whole document.
-  3. Once a selected node has no children (or none of its children seem
-     relevant), its raw text is collected as context.
-  4. Once enough context is collected, ask the LLM to answer using ONLY
-     that collected text.
+Given a question, walks a single document's PageIndex tree top-down:
+  1. At the root level, select relevant sections (LLM + keyword boost).
+  2. For each selected section, recurse into children in PARALLEL.
+  3. Collect leaf (or fallback) raw text as context.
+  4. Deduplicate by node id so the same section is never collected twice.
 
-This is deliberately plain recursive Python (no LangGraph) per the
-project plan.
-
-Two entry points are exported:
-  - collect_relevant_nodes(): runs steps 1-3 only and returns the raw
-    TreeNode list, with NO LLM synthesis. This is the primitive the
-    multi-document orchestrators (multi_doc_service.py, graph.py) call
-    once per candidate document, so they can merge nodes across many
-    documents before doing ONE final synthesis over all of them.
-  - answer_question(): the original single-document entry point (steps
-    1-4) - collects nodes via collect_relevant_nodes() and then also
-    synthesizes a final answer, for callers that just want one document
-    answered on its own.
+Improvements over sequential version:
+- Sibling subtrees are traversed concurrently via asyncio.gather.
+- visited_ids set prevents duplicate collection.
+- Robust number parsing from LLM replies.
+- Root-level selection blends LLM picks with simple keyword overlap
+  so broad questions are less likely to drop a relevant branch.
 """
+import asyncio
 import logging
 import re
+from typing import Optional
 
 from sqlalchemy.orm import Session
 
@@ -38,7 +27,7 @@ from app.services.ollama_service import chat_completion
 logger = logging.getLogger("pageindex.retrieval")
 
 MAX_SELECTIONS_PER_LEVEL = 3
-MAX_LEAF_NODES = 5
+MAX_LEAF_NODES = 6
 MAX_DEPTH = 6
 CONTEXT_CHARS_PER_NODE = 3000
 
@@ -72,7 +61,56 @@ def _build_children_map(nodes: list[TreeNode]) -> dict[str | None, list[TreeNode
     return children_map
 
 
-async def _select_relevant(question: str, candidates: list[TreeNode], level_label: str) -> list[TreeNode]:
+def _parse_selection_numbers(response: str, n_candidates: int) -> list[int]:
+    """
+    Robustly extract 1-based indices from an LLM reply.
+    Accepts '1,3', '1. 3', '[1, 2]', 'sections 1 and 3', etc.
+    Bounds-checks and preserves first-seen order.
+    """
+    numbers: list[int] = []
+    seen: set[int] = set()
+    for token in re.findall(r"\b\d+\b", response):
+        idx = int(token)
+        if 1 <= idx <= n_candidates and idx not in seen:
+            seen.add(idx)
+            numbers.append(idx)
+    return numbers
+
+
+def _keyword_overlap_score(question: str, node: TreeNode) -> float:
+    """
+    Cheap lexical overlap between question tokens and node title+summary+keywords.
+    Used as a safety net at root level so the LLM cannot completely drop
+    a section that clearly shares terms with the query.
+    """
+    q_tokens = set(re.findall(r"[a-z0-9]{3,}", question.lower()))
+    if not q_tokens:
+        return 0.0
+
+    blob_parts = [node.title or ""]
+    if node.summary:
+        blob_parts.append(node.summary)
+    if node.keywords:
+        try:
+            import json
+            kws = json.loads(node.keywords)
+            if isinstance(kws, list):
+                blob_parts.extend(str(k) for k in kws)
+        except Exception:
+            blob_parts.append(node.keywords)
+
+    blob = " ".join(blob_parts).lower()
+    hits = sum(1 for t in q_tokens if t in blob)
+    return hits / max(len(q_tokens), 1)
+
+
+async def _select_relevant(
+    question: str,
+    candidates: list[TreeNode],
+    level_label: str,
+    *,
+    is_root: bool = False,
+) -> list[TreeNode]:
     if not candidates:
         return []
 
@@ -80,7 +118,10 @@ async def _select_relevant(question: str, candidates: list[TreeNode], level_labe
         f"{i + 1}. {n.title} - {n.summary or '(no summary yet)'}"
         for i, n in enumerate(candidates)
     )
-    prompt = f"Question: {question}\n\nSections:\n{listing}\n\nWhich section numbers might contain the answer?"
+    prompt = (
+        f"Question: {question}\n\nSections:\n{listing}\n\n"
+        "Which section numbers might contain the answer?"
+    )
 
     logger.info(
         "[%s] Asking LLM to pick among %d candidates: %s",
@@ -88,16 +129,37 @@ async def _select_relevant(question: str, candidates: list[TreeNode], level_labe
     )
 
     response = await chat_completion(prompt=prompt, system=SELECTION_SYSTEM_PROMPT)
-
-    numbers = sorted(set(int(x) for x in re.findall(r"\d+", response)))
-    selected = [candidates[n - 1] for n in numbers if 1 <= n <= len(candidates)]
+    numbers = _parse_selection_numbers(response, len(candidates))
+    selected = [candidates[n - 1] for n in numbers]
     selected = selected[:MAX_SELECTIONS_PER_LEVEL]
+
+    # Root-level safety net: if LLM returned few/none, boost by keyword overlap
+    if is_root and len(selected) < MAX_SELECTIONS_PER_LEVEL:
+        scored = sorted(
+            (( _keyword_overlap_score(question, n), n) for n in candidates),
+            key=lambda x: x[0],
+            reverse=True,
+        )
+        already = {n.id for n in selected}
+        for score, node in scored:
+            if score < 0.15:
+                break
+            if node.id not in already:
+                selected.append(node)
+                already.add(node.id)
+                if len(selected) >= MAX_SELECTIONS_PER_LEVEL:
+                    break
+        if scored and scored[0][0] > 0:
+            logger.info(
+                "[%s] Keyword boost added sections: %s",
+                level_label,
+                [n.title for n in selected if n.id not in {candidates[i-1].id for i in numbers}],
+            )
 
     logger.info(
         "[%s] LLM raw reply=%r -> parsed_numbers=%s -> selected=%s",
         level_label, response, numbers, [n.title for n in selected],
     )
-
     return selected
 
 
@@ -107,31 +169,54 @@ async def _walk(
     children_map: dict[str | None, list[TreeNode]],
     depth: int,
     collected: list[TreeNode],
+    visited_ids: set[str],
+    lock: asyncio.Lock,
 ) -> None:
-    if len(collected) >= MAX_LEAF_NODES or depth > MAX_DEPTH:
-        return
+    async with lock:
+        if len(collected) >= MAX_LEAF_NODES or depth > MAX_DEPTH or node.id in visited_ids:
+            return
+        visited_ids.add(node.id)
 
     children = children_map.get(node.id, [])
     logger.info("[depth=%d] Visiting node %r (%d children)", depth, node.title, len(children))
 
     if not children:
-        logger.info("[depth=%d] Leaf node - collecting %r", depth, node.title)
-        collected.append(node)
+        async with lock:
+            if len(collected) < MAX_LEAF_NODES and node.id not in {n.id for n in collected}:
+                logger.info("[depth=%d] Leaf node - collecting %r", depth, node.title)
+                collected.append(node)
         return
 
-    selected_children = await _select_relevant(question, children, level_label=f"depth={depth}")
+    selected_children = await _select_relevant(
+        question, children, level_label=f"depth={depth}"
+    )
+
     if not selected_children:
-        if node.raw_text and node.raw_text.strip():
-            logger.info("[depth=%d] No relevant children - falling back to own text of %r", depth, node.title)
-            collected.append(node)
-        else:
-            logger.info("[depth=%d] No relevant children and no own text for %r - dropping branch", depth, node.title)
+        async with lock:
+            if (
+                node.raw_text
+                and node.raw_text.strip()
+                and len(collected) < MAX_LEAF_NODES
+                and node.id not in {n.id for n in collected}
+            ):
+                logger.info(
+                    "[depth=%d] No relevant children - falling back to own text of %r",
+                    depth, node.title,
+                )
+                collected.append(node)
+            else:
+                logger.info(
+                    "[depth=%d] No relevant children and no own text for %r - dropping branch",
+                    depth, node.title,
+                )
         return
 
-    for child in selected_children:
-        if len(collected) >= MAX_LEAF_NODES:
-            break
-        await _walk(question, child, children_map, depth + 1, collected)
+    # Parallel traversal of sibling branches
+    tasks = [
+        _walk(question, child, children_map, depth + 1, collected, visited_ids, lock)
+        for child in selected_children
+    ]
+    await asyncio.gather(*tasks)
 
 
 async def collect_relevant_nodes(
@@ -141,16 +226,8 @@ async def collect_relevant_nodes(
     nodes: list[TreeNode] | None = None,
 ) -> list[TreeNode]:
     """
-    Runs the tree-walk (steps 1-3 above) against ONE document and returns
-    the collected TreeNode rows relevant to `question` - no LLM synthesis,
-    no DB writes. This is what multi_doc_service.py and graph.py call once
-    per candidate document; they merge the results across every candidate
-    before doing a single final synthesis over all of them.
-
-    `nodes` lets a caller pass in an already-fetched list of this
-    document's TreeNode rows (avoids a duplicate query when the caller
-    already bulk-fetched them, e.g. multi_doc_service's
-    _fetch_nodes_by_document). If omitted, they're queried here.
+    Runs the tree-walk against ONE document and returns the collected
+    TreeNode rows relevant to `question` - no LLM synthesis.
     """
     if nodes is None:
         nodes = db.query(TreeNode).filter(TreeNode.document_id == document_id).all()
@@ -162,25 +239,41 @@ async def collect_relevant_nodes(
     children_map = _build_children_map(nodes)
     roots = children_map.get(None, [])
 
-    selected_roots = await _select_relevant(question, roots, level_label=f"doc={document_id} root")
+    selected_roots = await _select_relevant(
+        question, roots, level_label=f"doc={document_id} root", is_root=True
+    )
 
     collected: list[TreeNode] = []
-    for root in selected_roots:
-        if len(collected) >= MAX_LEAF_NODES:
-            break
-        await _walk(question, root, children_map, depth=1, collected=collected)
+    visited_ids: set[str] = set()
+    lock = asyncio.Lock()
+
+    # Parallel walk from each selected root
+    tasks = [
+        _walk(question, root, children_map, depth=1, collected=collected,
+              visited_ids=visited_ids, lock=lock)
+        for root in selected_roots
+    ]
+    await asyncio.gather(*tasks)
+
+    # Final dedup (defensive)
+    seen = set()
+    unique: list[TreeNode] = []
+    for n in collected:
+        if n.id not in seen:
+            seen.add(n.id)
+            unique.append(n)
 
     logger.info(
         "Document %s: collected %d node(s) for question %r: %s",
-        document_id, len(collected), question, [n.title for n in collected],
+        document_id, len(unique), question, [n.title for n in unique],
     )
-    return collected
+    return unique
 
 
 async def answer_question(db: Session, document_id: str, question: str) -> dict:
     """
-    Single-document entry point: collects relevant nodes for document_id
-    via collect_relevant_nodes(), then synthesizes one answer from them.
+    Single-document entry point: collects relevant nodes then synthesizes
+    one answer from them.
     """
     logger.info("=== New question for document %s: %r ===", document_id, question)
 
@@ -208,7 +301,10 @@ async def answer_question(db: Session, document_id: str, question: str) -> dict:
     context_blocks = []
     for n in collected:
         text = (n.raw_text or "").strip() or "(no direct text - see subsections)"
-        context_blocks.append(f"### {n.title} (pages {n.page_start}-{n.page_end})\n{text[:CONTEXT_CHARS_PER_NODE]}")
+        context_blocks.append(
+            f"### {n.title} (pages {n.page_start}-{n.page_end})\n"
+            f"{text[:CONTEXT_CHARS_PER_NODE]}"
+        )
     context = "\n\n".join(context_blocks)
 
     final_prompt = f"Document excerpts:\n\n{context}\n\nQuestion: {question}"

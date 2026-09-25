@@ -1,33 +1,22 @@
-### backend/app/services/reranker_service.py
 """
-Phase 6 (Chunk 4), Step 4a: lightweight embedding-based reranker.
+Lightweight embedding-based reranker.
 
-The multi-document orchestrator (multi_doc_service.py) can end up with
-more collected nodes than we want to stuff into the final answer prompt
-(e.g. 18 nodes from 8 candidate documents). Previously these were simply
-truncated in whatever order the candidate documents happened to be
-processed in - not based on actual relevance.
+Scores collected (document, node) pairs by cosine similarity between the
+question embedding and each node's title+summary embedding, keeps top_n.
 
-This module replaces that naive cap with a real (but cheap) relevance
-ranking: embed the question once, embed each candidate node's
-title+summary (not the full raw_text - keeps embedding calls fast and
-node summaries are already a concise stand-in for the node's content),
-score by cosine similarity, and keep only the top N.
-
-Deliberately has NO LLM /api/chat call in it - only /api/embed calls,
-which are much cheaper and faster. This keeps reranking viable even when
-there are dozens of candidate nodes.
+Uses batched /api/embed calls so ranking 30-40 nodes is one (or a few)
+HTTP requests instead of dozens of sequential ones.
 """
-import asyncio
 import logging
 import math
+from typing import List, Tuple
 
 from app.models.models import Document, TreeNode
-from app.services.ollama_service import get_embedding
+from app.services.ollama_service import get_embedding, get_embeddings_batch
 
 logger = logging.getLogger("pageindex.reranker")
 
-DEFAULT_TOP_N = 8
+DEFAULT_TOP_N = 10
 
 
 def _cosine_similarity(a: list[float], b: list[float]) -> float:
@@ -41,10 +30,8 @@ def _cosine_similarity(a: list[float], b: list[float]) -> float:
 
 def _node_embedding_text(node: TreeNode) -> str:
     """
-    What we actually embed for each node - title + summary, not the full
-    raw_text. Keeps embedding calls fast and consistent in size regardless
-    of how long a section's raw text is; the summary (from summary_service.py)
-    is already a compact stand-in for what the section covers.
+    What we embed for each node - title + summary, not the full raw_text.
+    Keeps embedding calls fast and consistent in size.
     """
     summary = node.summary or ""
     return f"{node.title}. {summary}".strip()
@@ -52,16 +39,14 @@ def _node_embedding_text(node: TreeNode) -> str:
 
 async def rerank_nodes(
     question: str,
-    nodes_with_documents: list[tuple[Document, TreeNode]],
+    nodes_with_documents: List[Tuple[Document, TreeNode]],
     top_n: int = DEFAULT_TOP_N,
-) -> list[tuple[Document, TreeNode]]:
+) -> List[Tuple[Document, TreeNode]]:
     """
-    Scores each (document, node) pair by cosine similarity between the
-    question's embedding and the node's title+summary embedding, and
-    returns the top_n highest-scoring pairs, sorted best-first.
+    Scores each (document, node) pair by cosine similarity and returns
+    the top_n highest-scoring pairs, sorted best-first.
 
-    If there are already <= top_n pairs, returns them unchanged (no need
-    to spend embedding calls ranking something that isn't being cut).
+    If there are already <= top_n pairs, returns them unchanged.
     """
     if len(nodes_with_documents) <= top_n:
         logger.info(
@@ -70,14 +55,13 @@ async def rerank_nodes(
         )
         return nodes_with_documents
 
-    logger.info("Reranking %d nodes down to top %d via embeddings", len(nodes_with_documents), top_n)
+    logger.info("Reranking %d nodes down to top %d via batch embeddings", len(nodes_with_documents), top_n)
 
     question_embedding = await get_embedding(question)
 
-    node_embeddings = await asyncio.gather(*[
-        get_embedding(_node_embedding_text(node))
-        for _, node in nodes_with_documents
-    ])
+    # Single batch call for all node texts
+    node_texts = [_node_embedding_text(node) for _, node in nodes_with_documents]
+    node_embeddings = await get_embeddings_batch(node_texts)
 
     scored = [
         (_cosine_similarity(question_embedding, node_emb), document, node)
@@ -85,7 +69,6 @@ async def rerank_nodes(
     ]
 
     scored.sort(key=lambda triple: triple[0], reverse=True)
-
     top = scored[:top_n]
 
     logger.info(

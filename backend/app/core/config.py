@@ -13,7 +13,7 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b"
     ollama_embedding_model: str = "nomic-embed-text"
-    ollama_timeout_seconds: int = 120
+    ollama_timeout_seconds: int = 180
 
     # --- File storage ---
     upload_dir: str = "uploads"
@@ -21,6 +21,21 @@ class Settings(BaseSettings):
 
     # --- CORS ---
     frontend_origin: str = "http://localhost:5173"
+
+    # --- Indexing concurrency ---
+    # How many documents can be indexed in parallel. Parsing is CPU-bound;
+    # LLM summary calls are I/O-bound. 3-4 is a safe default for a single
+    # local Ollama instance without saturating it.
+    max_concurrent_indexing: int = 3
+
+    # --- Summary concurrency ---
+    # Max parallel LLM summary calls within a single document (semaphore).
+    max_concurrent_summaries: int = 4
+
+    # --- Retrieval ---
+    max_candidate_documents: int = 15
+    max_total_context_nodes: int = 10
+    max_hops: int = 3
 
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 

@@ -1,11 +1,13 @@
-### ollama_service.py
 """
 Thin wrapper around the local Ollama server.
-Kept dependency-free (plain httpx) so we're not locked into a framework
-while the core tree-search logic is still being validated (see project plan).
+Kept dependency-free (plain httpx) so we're not locked into a framework.
+Supports single and batch embedding calls for high-throughput reranking.
+
+Handles both modern (/api/embed) and legacy (/api/embeddings) Ollama endpoints.
 """
 import logging
 import time
+from typing import List
 
 import httpx
 
@@ -16,42 +18,101 @@ logger = logging.getLogger("pageindex.ollama")
 
 async def get_embedding(text: str) -> list[float]:
     """
-    Gets a vector embedding for a piece of text from Ollama's embedding
-    endpoint (separate from /api/chat - this uses a dedicated embedding
-    model, e.g. nomic-embed-text, not the chat model qwen3:4b).
-
-    Used by reranker_service.py for cheap, LLM-free relevance scoring -
-    no /api/chat call involved here, so this is fast even for many nodes.
+    Gets a vector embedding for a single piece of text.
+    Prefer get_embeddings_batch() when you have multiple texts.
     """
-    payload = {
-        "model": settings.ollama_embedding_model,
-        "input": text,
-    }
+    vectors = await get_embeddings_batch([text])
+    return vectors[0]
+
+
+async def get_embeddings_batch(texts: List[str]) -> List[list[float]]:
+    """
+    Batch embedding: prefers /api/embed (modern, supports real batching).
+    Falls back to sequential /api/embeddings calls if the server returns 404
+    (older Ollama versions).
+    """
+    if not texts:
+        return []
+
+    # Ollama can handle reasonably large batches; chunk if extremely large
+    MAX_BATCH = 64
+    if len(texts) > MAX_BATCH:
+        results: List[list[float]] = []
+        for i in range(0, len(texts), MAX_BATCH):
+            chunk = texts[i : i + MAX_BATCH]
+            results.extend(await get_embeddings_batch(chunk))
+        return results
 
     start = time.monotonic()
     try:
         async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-            resp = await client.post(f"{settings.ollama_base_url}/api/embed", json=payload)
+            # --- Prefer modern endpoint ---
+            payload = {
+                "model": settings.ollama_embedding_model,
+                "input": texts,
+            }
+            resp = await client.post(
+                f"{settings.ollama_base_url}/api/embed", json=payload
+            )
+
+            if resp.status_code == 404:
+                # Older Ollama – fall back to legacy single-item endpoint
+                logger.warning(
+                    "Ollama /api/embed returned 404 – falling back to legacy "
+                    "/api/embeddings (consider upgrading Ollama)"
+                )
+                return await _legacy_embeddings_batch(client, texts)
+
             resp.raise_for_status()
             data = resp.json()
     except Exception:
         elapsed = time.monotonic() - start
-        logger.exception("Ollama EMBED REQUEST FAILED after %.1fs", elapsed)
+        logger.exception(
+            "Ollama BATCH EMBED REQUEST FAILED after %.1fs (n=%d)",
+            elapsed, len(texts),
+        )
         raise
 
     elapsed = time.monotonic() - start
-    # Ollama's /api/embed returns {"embeddings": [[...]]} - a list of vectors,
-    # one per input. We send one input at a time, so take the first.
     embeddings = data.get("embeddings", [])
-    if not embeddings:
-        raise ValueError(f"Ollama returned no embeddings for input of {len(text)} chars")
+    if len(embeddings) != len(texts):
+        raise ValueError(
+            f"Ollama returned {len(embeddings)} embeddings for {len(texts)} inputs"
+        )
 
-    vector = embeddings[0]
     logger.info(
-        "Ollama EMBED: elapsed=%.1fs text_chars=%d vector_dim=%d",
-        elapsed, len(text), len(vector),
+        "Ollama BATCH EMBED: elapsed=%.1fs n=%d total_chars=%d dim=%d",
+        elapsed,
+        len(texts),
+        sum(len(t) for t in texts),
+        len(embeddings[0]) if embeddings else 0,
     )
-    return vector
+    return embeddings
+
+
+async def _legacy_embeddings_batch(
+    client: httpx.AsyncClient, texts: List[str]
+) -> List[list[float]]:
+    """
+    Sequential fallback using the old /api/embeddings endpoint
+    (expects "prompt" and returns "embedding").
+    """
+    results: List[list[float]] = []
+    for text in texts:
+        payload = {
+            "model": settings.ollama_embedding_model,
+            "prompt": text,
+        }
+        resp = await client.post(
+            f"{settings.ollama_base_url}/api/embeddings", json=payload
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        emb = data.get("embedding")
+        if emb is None:
+            raise ValueError("Legacy /api/embeddings response missing 'embedding'")
+        results.append(emb)
+    return results
 
 
 def _strip_thinking(content: str) -> str:
@@ -106,7 +167,9 @@ async def chat_completion(prompt: str, system: str | None = None) -> str:
 
     try:
         async with httpx.AsyncClient(timeout=settings.ollama_timeout_seconds) as client:
-            resp = await client.post(f"{settings.ollama_base_url}/api/chat", json=payload)
+            resp = await client.post(
+                f"{settings.ollama_base_url}/api/chat", json=payload
+            )
             resp.raise_for_status()
             data = resp.json()
     except Exception:
