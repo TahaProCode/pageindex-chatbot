@@ -13,7 +13,14 @@ class Settings(BaseSettings):
     ollama_base_url: str = "http://localhost:11434"
     ollama_model: str = "qwen3:4b"
     ollama_embedding_model: str = "nomic-embed-text"
-    ollama_timeout_seconds: int = 120
+    ollama_timeout_seconds: int = 180
+
+    # --- Neo4j (Knowledge Graph) ---
+    neo4j_uri: str = "bolt://localhost:7687"
+    neo4j_user: str = "neo4j"
+    neo4j_password: str = "pageindex123"
+    # Set false to fully disable graph features (tree-only retrieval)
+    graph_enabled: bool = True
 
     # --- File storage ---
     upload_dir: str = "uploads"
@@ -22,8 +29,22 @@ class Settings(BaseSettings):
     # --- CORS ---
     frontend_origin: str = "http://localhost:5173"
 
+    # --- Indexing concurrency ---
+    max_concurrent_indexing: int = 3
+    max_concurrent_summaries: int = 4
+
+    # --- Retrieval ---
+    max_candidate_documents: int = 15
+    max_total_context_nodes: int = 10
+    max_hops: int = 3
+
+    # --- Knowledge Graph retrieval ---
+    # Max graph-neighbor nodes to pull when expanding context
+    graph_expand_limit: int = 5
+    # Min confidence (0-1) for extracted relations to store
+    kg_min_confidence: float = 0.4
+
     model_config = SettingsConfigDict(env_file=".env", extra="ignore")
 
 
-# Single shared settings instance, import this everywhere.
 settings = Settings()

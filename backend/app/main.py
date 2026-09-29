@@ -9,13 +9,14 @@ from app.core.config import settings
 from app.db.database import init_db
 from app.routers import health, documents, batches, chat
 from app.services.indexing_queue import start_worker
+from app.services.graph_db import get_driver, close_driver
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-app = FastAPI(title="PageIndex Chatbot API", version="0.2.0")
+app = FastAPI(title="PageIndex Chatbot API", version="0.3.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -35,11 +36,19 @@ app.include_router(chat.router)
 def on_startup():
     init_db()
     start_worker()
+    # Best-effort Neo4j connect (non-blocking for app start)
+    if settings.graph_enabled:
+        get_driver()
+
+
+@app.on_event("shutdown")
+def on_shutdown():
+    close_driver()
 
 
 # Serve the built React frontend as static files, so the whole app runs
 # on one port/origin. STATIC_DIR only exists in the Docker image (built by
-# the multi-stage Dockerfile below) - in local dev without Docker, this is
+# the multi-stage Dockerfile) - in local dev without Docker, this is
 # skipped and you run Vite separately on its own port as before.
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 

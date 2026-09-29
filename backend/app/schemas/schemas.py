@@ -78,3 +78,7 @@ class HealthOut(BaseModel):
     database: str
     ollama: str
     ollama_model: str
+    graph_db: str = "unknown"
+
+
+    

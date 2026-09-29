@@ -1,16 +1,19 @@
 """
 backend/app/graph.py
 
-LangGraph-powered Autonomous Multi-Agent Framework for PageIndex RAG.
+LangGraph-powered Autonomous Multi-Agent Framework for PageIndex RAG
+with optional Knowledge-Graph expansion.
 
 Key Capabilities:
 1. Decomposes complex/cross-document queries into precise sub-queries.
 2. Parallel context retrieval using Tree-Walking & Corpus Narrowing,
    scoped to a single upload-batch (batch_id).
-3. Reranks & evaluates context completeness dynamically.
-4. Auto-correcting feedback loop for missing context (Max Hops control).
-5. Synthesizes 99%+ accurate answers with complete source attribution/citations.
+3. Graph expansion: related sections via shared entities / relations.
+4. Reranks & evaluates context completeness dynamically.
+5. Auto-correcting feedback loop for missing context (Max Hops control).
+6. Synthesizes accurate answers with complete source attribution.
 """
+from __future__ import annotations
 
 import asyncio
 import logging
@@ -21,21 +24,21 @@ from typing import List, Dict, Any, Optional, TypedDict
 from sqlalchemy.orm import Session
 from langgraph.graph import StateGraph, END
 
-# Import existing core services from your codebase
 from app.models.models import Document, TreeNode
 from app.services.corpus_service import narrow_candidate_documents
 from app.services.retrieval_agent import collect_relevant_nodes
 from app.services.reranker_service import rerank_nodes
 from app.services.ollama_service import chat_completion
+from app.services.graph_retrieval_service import expand_context_via_graph
+from app.services.graph_db import is_graph_available
+from app.core.config import settings
 
 logger = logging.getLogger("pageindex.langgraph")
 
-# Configuration Constants
-MAX_TOTAL_CONTEXT_NODES = 10
+MAX_TOTAL_CONTEXT_NODES = settings.max_total_context_nodes
 CONTEXT_CHARS_PER_NODE = 3000
-MAX_HOPS = 3
+MAX_HOPS = settings.max_hops
 
-# Prompts
 DECOMPOSE_SYSTEM_PROMPT = (
     "You are an expert query analyzer. Your job is to break down a user query into concise, independent "
     "sub-queries required to search across a document database. If the query asks for comparisons or multi-part "
@@ -61,16 +64,13 @@ SYNTHESIS_SYSTEM_PROMPT = (
 )
 
 
-# ==========================================
-# 1. GRAPH STATE DEFINITION
-# ==========================================
 class RAGAgentState(TypedDict):
     db: Session
-    batch_id: str                       # required - which upload-batch this chat is scoped to
-    document_id: Optional[str]          # populated only for legacy single-document mode
+    batch_id: str
+    document_id: Optional[str]
     original_query: str
     sub_queries: List[str]
-    accumulated_context: List[Dict[str, Any]]  # Stores {"document": Doc, "node": Node}
+    accumulated_context: List[Dict[str, Any]]
     reranked_context: List[Dict[str, Any]]
     missing_info_query: Optional[str]
     hop_count: int
@@ -79,9 +79,6 @@ class RAGAgentState(TypedDict):
     sources: List[Dict[str, Any]]
 
 
-# ==========================================
-# 2. HELPER FUNCTIONS
-# ==========================================
 def _fetch_nodes_by_document(db: Session, document_ids: List[str]) -> Dict[str, List[TreeNode]]:
     if not document_ids:
         return {}
@@ -121,15 +118,10 @@ def _build_context_text(nodes_with_docs: List[Dict[str, Any]]) -> tuple[str, Lis
     return "\n\n".join(context_blocks), sources
 
 
-# ==========================================
-# 3. GRAPH NODE FUNCTIONS
-# ==========================================
 async def decompose_query_node(state: RAGAgentState) -> Dict[str, Any]:
-    """Node 1: Breaks complex query into sub-queries."""
     query = state["original_query"]
     logger.info("--- [LangGraph] Decomposing Query (batch=%s): %r ---", state.get("batch_id"), query)
 
-    # If scoped to a single document, skip heavy multi-query decomposition
     if state.get("document_id"):
         return {"sub_queries": [query], "hop_count": 0, "accumulated_context": []}
 
@@ -146,12 +138,14 @@ async def decompose_query_node(state: RAGAgentState) -> Dict[str, Any]:
         logger.warning("Failed to parse sub-queries JSON: %s. Using original query.", e)
         sub_queries = [query]
 
+    if not isinstance(sub_queries, list) or not sub_queries:
+        sub_queries = [query]
+
     logger.info("Generated Sub-Queries: %s", sub_queries)
     return {"sub_queries": sub_queries, "hop_count": 0, "accumulated_context": []}
 
 
 async def parallel_retrieval_node(state: RAGAgentState) -> Dict[str, Any]:
-    """Node 2: Executes parallel tree retrieval across all active sub-queries."""
     db = state["db"]
     doc_id = state.get("document_id")
     batch_id = state["batch_id"]
@@ -163,7 +157,6 @@ async def parallel_retrieval_node(state: RAGAgentState) -> Dict[str, Any]:
     new_gathered: List[Dict[str, Any]] = []
 
     if doc_id:
-        # Legacy Single Document Mode
         doc = db.query(Document).filter(Document.id == doc_id).first()
         nodes = db.query(TreeNode).filter(TreeNode.document_id == doc_id).all()
         for sq in sub_queries:
@@ -171,8 +164,6 @@ async def parallel_retrieval_node(state: RAGAgentState) -> Dict[str, Any]:
             for n in collected:
                 new_gathered.append({"document": doc, "node": n})
     else:
-        # Batch-Scoped Multi-Document Mode - only documents belonging to
-        # batch_id are ever considered as candidates.
         for sq in sub_queries:
             candidates = await narrow_candidate_documents(db, sq, batch_id=batch_id)
             if not candidates:
@@ -187,7 +178,6 @@ async def parallel_retrieval_node(state: RAGAgentState) -> Dict[str, Any]:
                 for n in collected_nodes:
                     new_gathered.append({"document": d, "node": n})
 
-    # Deduplicate accumulated context by node.id
     existing_items = state.get("accumulated_context", [])
     seen_node_ids = {item["node"].id for item in existing_items}
 
@@ -197,12 +187,33 @@ async def parallel_retrieval_node(state: RAGAgentState) -> Dict[str, Any]:
             seen_node_ids.add(item["node"].id)
             merged.append(item)
 
+    # --- Knowledge Graph expansion (hybrid) ---
+    if is_graph_available() and merged:
+        try:
+            extra = expand_context_via_graph(
+                db,
+                seed_items=merged,
+                batch_id=batch_id,
+                limit=settings.graph_expand_limit,
+            )
+            for item in extra:
+                if item["node"].id not in seen_node_ids:
+                    seen_node_ids.add(item["node"].id)
+                    merged.append(item)
+            if extra:
+                logger.info(
+                    "Graph expansion added %d nodes (total context now %d)",
+                    len(extra),
+                    len(merged),
+                )
+        except Exception:
+            logger.exception("Graph expansion failed (non-fatal)")
+
     logger.info("Total accumulated context nodes after Hop %d: %d", current_hop, len(merged))
     return {"accumulated_context": merged, "hop_count": current_hop}
 
 
 async def evaluate_and_rerank_node(state: RAGAgentState) -> Dict[str, Any]:
-    """Node 3: Reranks gathered context using embeddings & audits completeness."""
     accumulated = state.get("accumulated_context", [])
     query = state["original_query"]
     hop_count = state.get("hop_count", 1)
@@ -211,19 +222,16 @@ async def evaluate_and_rerank_node(state: RAGAgentState) -> Dict[str, Any]:
         logger.warning("No context gathered yet.")
         return {"is_complete": False, "missing_info_query": query, "reranked_context": []}
 
-    # Transform for reranker service format: List[tuple[Document, TreeNode]]
     raw_pairs = [(item["document"], item["node"]) for item in accumulated]
     reranked_pairs = await rerank_nodes(query, raw_pairs, top_n=MAX_TOTAL_CONTEXT_NODES)
 
     reranked_items = [{"document": d, "node": n} for d, n in reranked_pairs]
     context_text, _ = _build_context_text(reranked_items)
 
-    # Stop condition check if max hops reached
     if hop_count >= MAX_HOPS:
         logger.info("Max hops (%d) reached. Proceeding to answer.", MAX_HOPS)
         return {"is_complete": True, "reranked_context": reranked_items, "missing_info_query": None}
 
-    # Completeness audit
     eval_prompt = f"User Question: {query}\n\nGathered Excerpts:\n{context_text}\n\nIs this sufficient?"
     response = await chat_completion(prompt=eval_prompt, system=EVALUATE_SYSTEM_PROMPT)
 
@@ -236,7 +244,7 @@ async def evaluate_and_rerank_node(state: RAGAgentState) -> Dict[str, Any]:
         return {
             "is_complete": False,
             "missing_info_query": missing_query,
-            "sub_queries": [missing_query],  # Overwrite sub-queries for next hop loop
+            "sub_queries": [missing_query],
             "reranked_context": reranked_items,
         }
 
@@ -245,7 +253,6 @@ async def evaluate_and_rerank_node(state: RAGAgentState) -> Dict[str, Any]:
 
 
 async def synthesize_answer_node(state: RAGAgentState) -> Dict[str, Any]:
-    """Node 4: Synthesizes final response with verified citations."""
     reranked = state.get("reranked_context", [])
     query = state["original_query"]
 
@@ -264,36 +271,23 @@ async def synthesize_answer_node(state: RAGAgentState) -> Dict[str, Any]:
     return {"final_answer": final_answer, "sources": sources}
 
 
-# ==========================================
-# 4. CONDITIONAL ROUTER
-# ==========================================
 def completion_router(state: RAGAgentState) -> str:
-    """Routes execution: If complete or max hops hit -> Synthesize, else Loop Back."""
     if state.get("is_complete") or state.get("hop_count", 0) >= MAX_HOPS:
         return "synthesize"
     return "retrieve"
 
 
-# ==========================================
-# 5. GRAPH BUILDER & EXECUTOR
-# ==========================================
 def build_rag_graph() -> StateGraph:
     workflow = StateGraph(RAGAgentState)
 
-    # Add Nodes
     workflow.add_node("decompose", decompose_query_node)
     workflow.add_node("retrieve", parallel_retrieval_node)
     workflow.add_node("evaluate", evaluate_and_rerank_node)
     workflow.add_node("synthesize", synthesize_answer_node)
 
-    # Set Entry Point
     workflow.set_entry_point("decompose")
-
-    # Connect Edges
     workflow.add_edge("decompose", "retrieve")
     workflow.add_edge("retrieve", "evaluate")
-
-    # Conditional Loop Edge
     workflow.add_conditional_edges(
         "evaluate",
         completion_router,
@@ -302,30 +296,19 @@ def build_rag_graph() -> StateGraph:
             "retrieve": "retrieve",
         },
     )
-
     workflow.add_edge("synthesize", END)
     return workflow.compile()
 
 
-# Global compiled instance
 langgraph_app = build_rag_graph()
 
 
-# Interface function to trigger graph execution
 async def run_langgraph_chat(
     db: Session,
     query: str,
     batch_id: str,
     document_id: Optional[str] = None,
 ) -> Dict[str, Any]:
-    """
-    Main entry point for API routers to execute LangGraph agent execution.
-
-    batch_id is now required: every chat is scoped to one upload-batch, and
-    cross-document retrieval only ever searches within that batch's
-    documents. document_id is kept as an optional override for legacy
-    single-document scoping and, when provided, must belong to batch_id.
-    """
     initial_state: RAGAgentState = {
         "db": db,
         "batch_id": batch_id,
@@ -347,4 +330,5 @@ async def run_langgraph_chat(
         "answer": result_state.get("final_answer"),
         "sources": result_state.get("sources", []),
         "hops_used": result_state.get("hop_count", 1),
+        "graph_used": is_graph_available(),
     }

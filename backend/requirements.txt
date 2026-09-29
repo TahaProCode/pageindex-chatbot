@@ -9,3 +9,5 @@ httpx==0.27.2
 python-dotenv==1.0.1
 pymupdf==1.28.2
 langgraph
+pdfplumber
+neo4j>=5.14.0

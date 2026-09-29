@@ -8,13 +8,37 @@ services:
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: pageindex_db
     ports:
-      # Host-side access only (e.g. Adminer, a local psql client). The
-      # backend container talks to Postgres over the internal Docker
-      # network using the hostname "postgres", so this mapping doesn't
-      # need to match any port your backend uses.
       - "5434:5432"
     volumes:
       - pageindex_pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  neo4j:
+    image: neo4j:5.26-community
+    container_name: pageindex-neo4j
+    restart: unless-stopped
+    environment:
+      NEO4J_AUTH: neo4j/pageindex123
+      NEO4J_PLUGINS: '["apoc"]'
+      NEO4J_dbms_security_procedures_unrestricted: apoc.*
+      NEO4J_dbms_memory_heap_initial__size: 512m
+      NEO4J_dbms_memory_heap_max__size: 1G
+    ports:
+      - "7474:7474" # Browser UI
+      - "7687:7687" # Bolt
+    volumes:
+      - pageindex_neo4j_data:/data
+      - pageindex_neo4j_logs:/logs
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:7474 || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
 
   adminer:
     image: adminer
@@ -23,7 +47,8 @@ services:
     ports:
       - "8080:8080"
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
 
   backend:
     build:
@@ -32,23 +57,32 @@ services:
     container_name: pageindex-backend
     restart: unless-stopped
     environment:
-      # Internal Docker network hostname "postgres", not localhost.
       DATABASE_URL: postgresql+psycopg2://postgres:postgres@postgres:5432/pageindex_db
-      # host.docker.internal lets the container reach Ollama running on
-      # your Windows host machine (works out of the box on Docker Desktop).
       OLLAMA_BASE_URL: http://host.docker.internal:11434
       OLLAMA_MODEL: qwen2.5:7b
       OLLAMA_TIMEOUT_SECONDS: "360"
       UPLOAD_DIR: /app/uploads
       MAX_UPLOAD_SIZE_MB: "50"
       FRONTEND_ORIGIN: http://localhost:8000
+      # Neo4j (internal Docker network hostname)
+      NEO4J_URI: bolt://neo4j:7687
+      NEO4J_USER: neo4j
+      NEO4J_PASSWORD: pageindex123
+      GRAPH_ENABLED: "true"
     ports:
       - "7000:8000"
     volumes:
       - pageindex_uploads:/app/uploads
     depends_on:
-      - postgres
+      postgres:
+        condition: service_healthy
+      neo4j:
+        condition: service_healthy
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
 
 volumes:
   pageindex_pg_data:
   pageindex_uploads:
+  pageindex_neo4j_data:
+  pageindex_neo4j_logs:
