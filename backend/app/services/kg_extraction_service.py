@@ -10,8 +10,8 @@ Designed for local small models (qwen3:4b / qwen2.5:7b):
   - Robust parsing with fallbacks
   - Confidence filtering
 """
-from __future__ import annotations
 
+from __future__ import annotations
 import json
 import logging
 import re

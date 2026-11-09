@@ -24,8 +24,6 @@ def is_graph_available() -> bool:
     """True only when graph is enabled and a live driver exists."""
     if not settings.graph_enabled:
         return False
-    if _connection_failed:
-        return False
     try:
         return get_driver() is not None
     except Exception:
@@ -33,13 +31,14 @@ def is_graph_available() -> bool:
 
 
 def get_driver():
-    """Lazy-create the Neo4j driver. Returns None if disabled or unreachable."""
+    """
+    Lazy-create the Neo4j driver. Returns None if disabled or unreachable.
+
+    On failure we allow periodic retry (Neo4j often starts after the API).
+    """
     global _driver, _connection_failed
 
     if not settings.graph_enabled:
-        return None
-
-    if _connection_failed:
         return None
 
     if _driver is not None:
@@ -48,19 +47,19 @@ def get_driver():
     try:
         from neo4j import GraphDatabase
 
-        _driver = GraphDatabase.driver(
+        driver = GraphDatabase.driver(
             settings.neo4j_uri,
             auth=(settings.neo4j_user, settings.neo4j_password),
         )
-        # Verify connectivity once
-        _driver.verify_connectivity()
+        driver.verify_connectivity()
+        _driver = driver
+        _connection_failed = False
         logger.info("Neo4j connected: %s", settings.neo4j_uri)
         _ensure_schema(_driver)
         return _driver
     except Exception as e:
         logger.warning(
-            "Neo4j unavailable (%s). Graph features disabled until restart. "
-            "Error: %s",
+            "Neo4j unavailable (%s). Will retry on next call. Error: %s",
             settings.neo4j_uri,
             e,
         )

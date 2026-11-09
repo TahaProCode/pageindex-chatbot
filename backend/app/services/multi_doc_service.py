@@ -1,13 +1,6 @@
 """
-Multi-document orchestrator (batch-scoped) with multi-hop loop
-and optional Knowledge-Graph expansion.
-
-Pipeline:
-  1. narrow_candidate_documents() - shortlist within the batch
-  2. parallel tree-search on candidates
-  3. graph expansion (related sections via entities)
-  4. embedding rerank
-  5. completeness check; if incomplete, re-search for the gap (max hops)
+Multi-document orchestrator with Phase 1–4 retrieval upgrades
+(same behavior as LangGraph path for the non-LangGraph fallback).
 """
 from __future__ import annotations
 
@@ -23,8 +16,12 @@ from app.services.corpus_service import narrow_candidate_documents
 from app.services.retrieval_agent import collect_relevant_nodes
 from app.services.reranker_service import rerank_nodes
 from app.services.ollama_service import chat_completion
-from app.services.graph_retrieval_service import expand_context_via_graph
+from app.services.graph_retrieval_service import (
+    expand_context_via_graph,
+    sections_from_query_entities,
+)
 from app.services.graph_db import is_graph_available
+from app.services.query_rewrite_service import is_weak_context, generate_two_search_queries
 
 logger = logging.getLogger("pageindex.multidoc")
 
@@ -32,13 +29,15 @@ CONTEXT_CHARS_PER_NODE = 3000
 
 MULTI_DOC_ANSWER_SYSTEM_PROMPT = (
     "Answer the user's question using ONLY the document excerpts provided "
-    "below. The excerpts come from multiple different source documents, "
-    "each one labeled with its document filename and section title. When "
-    "you use information from an excerpt, mention which document it came "
-    "from (by filename). If the excerpts don't fully answer the question, "
-    "say what you found and note what's missing. Do not use outside "
-    "knowledge. Keep the answer concise and clear."
+    "below. Excerpts may come from multiple documents.\n"
+    "Rules:\n"
+    "- Focus only on what was asked; ignore unrelated sections.\n"
+    "- Write clear Markdown: short summary, then ## headings and bullets.\n"
+    "- Mention source filename in parentheses when citing a fact.\n"
+    "- Do not invent facts. Keep the answer concise and structured."
 )
+
+FINAL_CONTEXT_NODES = 4
 
 NO_CONTEXT_SYSTEM_PROMPT = (
     "Answer the question honestly. If you don't have enough information to "
@@ -57,8 +56,7 @@ COMPLETENESS_CHECK_SYSTEM_PROMPT = (
     "Reply in EXACTLY ONE of these two formats, nothing else:\n"
     "COMPLETE\n"
     "or\n"
-    "INCOMPLETE: <a short, specific description of the missing information, "
-    "phrased as something to search for>"
+    "INCOMPLETE: <short search phrase for the missing fact, max 12 words>"
 )
 
 
@@ -83,48 +81,9 @@ async def _collect_for_document(
     nodes: list[TreeNode],
 ) -> tuple[Document, list[TreeNode]]:
     if not nodes:
-        logger.info("Document %s (%s) has no tree nodes - skipping", document.id, document.filename)
         return document, []
     collected = await collect_relevant_nodes(db, document.id, search_query, nodes=nodes)
     return document, collected
-
-
-async def _gather_context(
-    db: Session,
-    search_query: str,
-    batch_id: str,
-    hop_label: str,
-) -> list[tuple[Document, TreeNode]]:
-    candidates = await narrow_candidate_documents(db, search_query, batch_id=batch_id)
-    if not candidates:
-        logger.info(
-            "[%s] No candidate documents found in batch %s for query %r",
-            hop_label, batch_id, search_query,
-        )
-        return []
-
-    candidate_ids = [doc.id for doc in candidates]
-    nodes_by_document = _fetch_nodes_by_document(db, candidate_ids)
-
-    logger.info(
-        "[%s] Running tree-search in parallel across %d candidate documents "
-        "(batch=%s) for query %r: %s",
-        hop_label, len(candidates), batch_id, search_query,
-        [d.filename for d in candidates],
-    )
-
-    results = await asyncio.gather(*[
-        _collect_for_document(db, doc, search_query, nodes_by_document.get(doc.id, []))
-        for doc in candidates
-    ])
-
-    gathered: list[tuple[Document, TreeNode]] = []
-    for document, collected_nodes in results:
-        for node in collected_nodes:
-            gathered.append((document, node))
-
-    logger.info("[%s] Gathered %d raw nodes", hop_label, len(gathered))
-    return gathered
 
 
 def _merge_unique(
@@ -140,21 +99,67 @@ def _merge_unique(
     return merged
 
 
+def _items_to_tuples(items: list[dict]) -> list[tuple[Document, TreeNode]]:
+    return [(i["document"], i["node"]) for i in items]
+
+
+def _tuples_to_items(pairs: list[tuple[Document, TreeNode]]) -> list[dict]:
+    return [{"document": d, "node": n} for d, n in pairs]
+
+
+async def _gather_tree(
+    db: Session,
+    search_query: str,
+    batch_id: str,
+    hop_label: str,
+) -> list[tuple[Document, TreeNode]]:
+    candidates = await narrow_candidate_documents(db, search_query, batch_id=batch_id)
+    if not candidates:
+        logger.info("[%s] No candidate documents for %r", hop_label, search_query)
+        return []
+
+    nodes_by_document = _fetch_nodes_by_document(db, [d.id for d in candidates])
+    results = await asyncio.gather(*[
+        _collect_for_document(db, doc, search_query, nodes_by_document.get(doc.id, []))
+        for doc in candidates
+    ])
+
+    gathered: list[tuple[Document, TreeNode]] = []
+    for document, collected_nodes in results:
+        for node in collected_nodes:
+            gathered.append((document, node))
+    logger.info("[%s] Tree gathered %d nodes", hop_label, len(gathered))
+    return gathered
+
+
+def _shorten_missing_query(raw: str, original: str) -> str:
+    text = (raw or "").strip()
+    text = re.sub(
+        r"^(the provided excerpts.*?needed\.?\s*)",
+        "",
+        text,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    text = re.sub(r"\s+", " ", text).strip()
+    words = text.split()
+    if len(words) > 12:
+        text = " ".join(words[:12])
+    return text if len(text) >= 3 else original
+
+
 async def _check_completeness(question: str, context_text: str) -> tuple[bool, str | None]:
     prompt = (
         f"Question: {question}\n\nGathered excerpts:\n{context_text}\n\n"
         "Is this enough to fully answer the question?"
     )
     response = await chat_completion(prompt=prompt, system=COMPLETENESS_CHECK_SYSTEM_PROMPT)
-
     stripped = response.strip()
     match = re.match(r"INCOMPLETE\s*:\s*(.+)", stripped, re.IGNORECASE | re.DOTALL)
     if match:
-        missing_query = match.group(1).strip()
-        logger.info("Completeness check: INCOMPLETE - missing=%r", missing_query)
-        return False, missing_query or None
-
-    logger.info("Completeness check: COMPLETE (raw reply=%r)", stripped)
+        missing_query = _shorten_missing_query(match.group(1).strip(), question)
+        logger.info("Completeness: INCOMPLETE short=%r", missing_query)
+        return False, missing_query
+    logger.info("Completeness: COMPLETE")
     return True, None
 
 
@@ -181,41 +186,78 @@ def _build_context_text(
     return "\n\n".join(context_blocks), sources
 
 
+async def _enrich_with_graph(
+    db: Session,
+    batch_id: str,
+    search_query: str,
+    accumulated: list[tuple[Document, TreeNode]],
+) -> list[tuple[Document, TreeNode]]:
+    if not is_graph_available():
+        return accumulated
+
+    try:
+        entity_items = sections_from_query_entities(db, search_query, batch_id)
+        accumulated = _merge_unique(accumulated, _items_to_tuples(entity_items))
+        logger.info("Query-entity added=%d total=%d", len(entity_items), len(accumulated))
+    except Exception:
+        logger.exception("Query-entity search failed")
+
+    if not accumulated:
+        return accumulated
+
+    try:
+        extra = expand_context_via_graph(
+            db,
+            seed_items=_tuples_to_items(accumulated),
+            batch_id=batch_id,
+            limit=settings.graph_expand_limit,
+        )
+        before = len(accumulated)
+        accumulated = _merge_unique(accumulated, _items_to_tuples(extra))
+        logger.info(
+            "Graph expand: graph_added=%d total=%d",
+            len(accumulated) - before,
+            len(accumulated),
+        )
+    except Exception:
+        logger.exception("Graph expand failed")
+
+    return accumulated
+
+
 async def answer_question_multi_doc(db: Session, question: str, batch_id: str) -> dict:
     max_hops = settings.max_hops
     max_context = settings.max_total_context_nodes
 
-    logger.info("=== New multi-document question for batch %s: %r ===", batch_id, question)
+    logger.info("=== multi-doc question batch=%s: %r ===", batch_id, question)
 
     accumulated: list[tuple[Document, TreeNode]] = []
     search_query = question
     hop = 0
+    rewrite_attempted = False
 
     for hop in range(1, max_hops + 1):
         hop_label = f"batch={batch_id} hop={hop}/{max_hops}"
 
-        new_nodes = await _gather_context(
-            db, search_query, batch_id=batch_id, hop_label=hop_label
-        )
-        accumulated = _merge_unique(accumulated, new_nodes)
+        tree_nodes = await _gather_tree(db, search_query, batch_id, hop_label)
+        accumulated = _merge_unique(accumulated, tree_nodes)
+        accumulated = await _enrich_with_graph(db, batch_id, search_query, accumulated)
 
-        # Graph expansion after each hop's tree retrieval
-        if is_graph_available() and accumulated:
+        if is_weak_context(len(accumulated)) and not rewrite_attempted:
+            rewrite_attempted = True
+            logger.info("[%s] Weak context — rewrite 2 queries", hop_label)
             try:
-                seed_items = [{"document": d, "node": n} for d, n in accumulated]
-                extra = expand_context_via_graph(
-                    db,
-                    seed_items=seed_items,
-                    batch_id=batch_id,
-                    limit=settings.graph_expand_limit,
-                )
-                extra_tuples = [(item["document"], item["node"]) for item in extra]
-                accumulated = _merge_unique(accumulated, extra_tuples)
+                rewritten = await generate_two_search_queries(db, batch_id, question)
+                for rq in rewritten:
+                    more = await _gather_tree(
+                        db, rq, batch_id, hop_label + f" rewrite={rq[:40]}"
+                    )
+                    accumulated = _merge_unique(accumulated, more)
+                    accumulated = await _enrich_with_graph(db, batch_id, rq, accumulated)
             except Exception:
-                logger.exception("[%s] Graph expansion failed (non-fatal)", hop_label)
+                logger.exception("Rewrite recovery failed")
 
         if not accumulated:
-            logger.info("[%s] No relevant nodes found in any candidate document yet", hop_label)
             if hop == max_hops:
                 break
             continue
@@ -224,36 +266,38 @@ async def answer_question_multi_doc(db: Session, question: str, batch_id: str) -
         context_text, sources = _build_context_text(reranked)
 
         if hop == max_hops:
-            logger.info("[%s] Reached MAX_HOPS - using accumulated context as-is", hop_label)
             break
 
         is_complete, missing_query = await _check_completeness(question, context_text)
         if is_complete or not missing_query:
-            logger.info("[%s] Context judged complete - stopping hops", hop_label)
             break
 
-        logger.info("[%s] Context incomplete - next hop will search for: %r", hop_label, missing_query)
         search_query = missing_query
+        logger.info("[%s] Next hop search=%r", hop_label, search_query)
 
     if not accumulated:
-        logger.info("No relevant nodes found across any hop in batch %s", batch_id)
         answer = await chat_completion(
             prompt=f"Question: {question}\n\n(No relevant section of any document was found.)",
             system=NO_CONTEXT_SYSTEM_PROMPT,
         )
-        return {"answer": answer, "sources": [], "hops_used": hop, "graph_used": is_graph_available()}
+        return {
+            "answer": answer,
+            "sources": [],
+            "hops_used": hop,
+            "graph_used": is_graph_available(),
+        }
 
     reranked = await rerank_nodes(question, accumulated, top_n=max_context)
-    context_text, sources = _build_context_text(reranked)
-
-    logger.info(
-        "Generating final multi-document answer from %d context nodes"
-        "(batch=%s, hops_used=%d, graph=%s)",
-        len(reranked), batch_id, hop, is_graph_available(),
+    focused = reranked[:FINAL_CONTEXT_NODES]
+    context_text, sources = _build_context_text(focused)
+    final_prompt = (
+        f"Document excerpts:\n\n{context_text}\n\n"
+        f"Question: {question}\n\n"
+        "Write a structured Markdown answer focused only on this question."
     )
-    final_prompt = f"Document excerpts:\n\n{context_text}\n\nQuestion: {question}"
     answer = await chat_completion(prompt=final_prompt, system=MULTI_DOC_ANSWER_SYSTEM_PROMPT)
 
+    logger.info("Final answer from %d/%d nodes, citations=%d", len(focused), len(reranked), len(sources))
     return {
         "answer": answer,
         "sources": sources,
