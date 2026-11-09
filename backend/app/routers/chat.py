@@ -90,7 +90,7 @@ async def send_message(session_id: str, body: MessageIn, db: Session = Depends(g
     db.commit()
 
     documents = db.query(Document).filter(Document.batch_id == session.batch_id).all()
-    not_ready = [d for d in documents if d.status != DocumentStatus.ready]
+    not_ready = [d for d in documents if d.status == DocumentStatus.ready]
 
     if not documents or not_ready:
         if not documents:
