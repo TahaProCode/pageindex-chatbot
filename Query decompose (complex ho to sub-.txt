@@ -1,0 +1,7 @@
+Query decompose (complex ho to sub-queries)
+Batch me candidate documents narrow
+Tree-walk se relevant sections
+Graph expansion — seed sections ke entities se linked sections
+Rerank (question embedding vs section title+summary) → top N
+Completeness check; zarurat ho to multi-hop dobara search
+LLM answer + citations (filename, section, pages)
